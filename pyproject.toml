@@ -1,0 +1,49 @@
+[project]
+name = "tsl-recorder"
+version = "0.1.0"
+description = "TSL recorder: the poc1 Setup / Record / Library app (realsense-recorder 93df15b) in PySide6"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=5.0.0.93",
+    "numpy>=1.26.0",
+    "psutil>=5.9.0",
+    "rosbags>=0.10.0",
+    "rosbags-image>=0.10.0",
+    "pyrealsense2>=2.58.2.10647",
+    "pyside6-essentials>=6.12.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+recorder = "recorder.gui:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/recorder"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.uv]
+package = true
+# The versions of the poc1 lock file (realsense-recorder 93df15b uv.lock), so the camera and recording code runs on the same libraries.
+constraint-dependencies = [
+    "opencv-python==5.0.0.93",
+    "pyrealsense2==2.58.3.10794",
+    "rosbags==0.11.3",
+    "rosbags-image==0.10.3",
+    "psutil==7.2.2",
+    "apsw==3.53.4.0",
+    "numpy==2.2.6; python_full_version < '3.11'",
+    "numpy==2.4.6; python_full_version == '3.11.*'",
+    "numpy==2.5.1; python_full_version >= '3.12'",
+]
