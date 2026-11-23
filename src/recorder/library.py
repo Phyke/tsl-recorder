@@ -43,7 +43,7 @@ from recorder.theme import (
     set_label_colors,
     show_rgb,
     show_text,
-    tk_default_font,
+    text_size,
 )
 from recorder.export import export_to_mp4, list_media_files
 from recorder.device_enum import quiet_opencv
@@ -123,8 +123,7 @@ class LibraryPage(QFrame):
             f"QListWidget {{ background: {FIELD}; color: {INK}; border: 0; }}"
             f"QListWidget::item:selected {{ background: {ACCENT}; color: #ffffff; }}"
         )
-        self.listbox.setFixedWidth(self.listbox.fontMetrics().horizontalAdvance("0") * 36 + 4)
-        self.listbox.setMinimumHeight(self.listbox.fontMetrics().lineSpacing() * 22)
+        text_size(self.listbox, chars=36, pad=4, lines=22)
         inner = QWidget(left)
         inner_column = QVBoxLayout(inner)
         inner_column.setContentsMargins(8, 0, 8, 10)
@@ -168,11 +167,10 @@ class LibraryPage(QFrame):
         export_grid.setContentsMargins(12, 14, 12, 10)
         export_grid.setHorizontalSpacing(8)
         codec_label = label(export, "Codec", fg=MUTED)
-        codec_label.setFont(tk_default_font())
         export_grid.addWidget(codec_label, 0, 0, Qt.AlignmentFlag.AlignLeft)
         self.codec_combo = NoWheelComboBox(export)
         self.codec_combo.addItems(["h264", "h265"])
-        self.codec_combo.setFixedWidth(self.codec_combo.fontMetrics().horizontalAdvance("0") * 10 + 30)
+        text_size(self.codec_combo, chars=10, pad=30)
         export_grid.addWidget(self.codec_combo, 0, 1, Qt.AlignmentFlag.AlignLeft)
         export_grid.addWidget(button(export, "Export selected", self.export_selected, color=BLUE), 0, 2)
         export_grid.addWidget(button(export, "Choose file…", self.export_browse, color="#475569"), 0, 3, Qt.AlignmentFlag.AlignLeft)

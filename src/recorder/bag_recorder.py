@@ -9,6 +9,7 @@ Recording is armed only at Record time — never during Start preview.
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -20,8 +21,36 @@ logger = logging.getLogger("poc1.bag")
 #   "Output file must have .db3 extension"
 _RECORD_SUFFIX: Optional[str] = ".db3"
 
-# Build stamp so operators can confirm they are not on a stale Phue copy.
-BUILD_ID = "sdk-record-v44-2026-10-12"
+# The last build number of poc1 (realsense-recorder 93df15b, "sdk-record-v44-2026-10-12"). The count goes on from it.
+POC1_LAST_BUILD = 44
+
+
+def _git(*args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=Path(__file__).parent,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+# Build stamp so operators can confirm which code runs: "sdk-record-v{number}-{commit date} {short hash}".
+# The number is POC1_LAST_BUILD plus the commit count, so each commit adds 1. With no git (or no repository), the stamp is "unknown commit".
+def _build_id() -> str:
+    try:
+        count = int(_git("rev-list", "--count", "HEAD"))
+        commit_hash, commit_date = _git("log", "-1", "--date=short", "--format=%h %cd").split()
+    except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError):
+        return "unknown commit"
+    return f"sdk-record-v{POC1_LAST_BUILD + count}-{commit_date} {commit_hash}"
+
+
+BUILD_ID = _build_id()
 
 
 def can_record_bag(source: Any) -> bool:

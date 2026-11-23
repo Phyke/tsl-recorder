@@ -32,7 +32,7 @@ from recorder.theme import (  # noqa: E402
     show_rgb,
     show_text,
     style_check_box,
-    tk_default_font,
+    text_size,
 )
 from recorder.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud  # noqa: E402
 from recorder.devices import StreamMode, pick_auto_camera_for_slot  # noqa: E402
@@ -97,8 +97,8 @@ class CameraCard(QFrame):
 
         self._label(form, grid, "File prefix", 2)
         self.prefix_entry = QLineEdit(slot.prefix, form)
-        self.prefix_entry.setFont(tk_default_font())
-        self.prefix_entry.setFixedWidth(self.prefix_entry.fontMetrics().horizontalAdvance("0") * 12 + 10)
+        self.prefix_entry.setFont(font(("Segoe UI", 9)))
+        text_size(self.prefix_entry, chars=12, pad=10)
         grid.addWidget(self.prefix_entry, 2, 1, Qt.AlignmentFlag.AlignLeft)
         self.prefix_entry.textChanged.connect(lambda _text: self._sync_prefix())
 
@@ -155,7 +155,7 @@ class CameraCard(QFrame):
     @staticmethod
     def _label(master: QWidget, grid, text: str, row: int) -> None:
         widget = label(master, text, fg=MUTED, font_spec=("Segoe UI", 9))
-        widget.setMinimumWidth(widget.fontMetrics().horizontalAdvance("0") * 12)
+        text_size(widget, chars=12, fixed=False)
         grid.addWidget(widget, row, 0, Qt.AlignmentFlag.AlignLeft)
 
     def load_devices(self, auto_assign: bool = False) -> None:

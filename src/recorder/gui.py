@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer
+from PySide6.QtCore import QEvent, QLocale, QObject, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,10 +29,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QScrollArea,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -58,21 +60,25 @@ from recorder.theme import (
     BG,
     BLUE,
     BORDER,
+    FONT_SIZE_RANGE,
     GREEN,
     INK,
     MUTED,
     PANEL,
     RED,
     SURFACE,
+    NoWheelComboBox,
     apply_styles,
     button,
     font,
+    font_size,
     frame,
     image_label,
     label,
+    set_font_size,
     show_rgb,
     show_text,
-    tk_default_font,
+    text_size,
 )
 from recorder.session import MultiCamSession
 from recorder.devices import is_fhd_high_rate, too_many_1080p120
@@ -204,12 +210,14 @@ class UnifiedApp:
         self.setup_page = QWidget()
         self.record_page = QWidget()
         self.library_page = QWidget()
-        for page in (self.setup_page, self.record_page, self.library_page):
+        self.settings_page = QWidget()
+        for page in (self.setup_page, self.record_page, self.library_page, self.settings_page):
             page.setObjectName("page")
             page.setStyleSheet(f"QWidget#page {{ background: {BG}; }}")
         self.notebook.addTab(self.setup_page, "  Setup  ")
         self.notebook.addTab(self.record_page, "  Record  ")
         self.notebook.addTab(self.library_page, "  Library  ")
+        self.notebook.addTab(self.settings_page, "  Settings  ")
 
         self._build_setup()
         self._build_record()
@@ -217,7 +225,54 @@ class UnifiedApp:
         library_layout = QVBoxLayout(self.library_page)
         library_layout.setContentsMargins(0, 0, 0, 0)
         library_layout.addWidget(self.library)
+        self._build_settings()
         self.notebook.currentChanged.connect(lambda _index: self._on_tab())
+
+    # The Settings tab: a list of setting groups on the left, and the page of the selected group on the right.
+    def _build_settings(self) -> None:
+        row = QHBoxLayout(self.settings_page)
+        row.setContentsMargins(8, 8, 8, 8)
+        row.setSpacing(8)
+        self.settings_list = QListWidget()
+        self.settings_list.setFont(font(("Segoe UI", 10)))
+        text_size(self.settings_list, chars=25, pad=5)
+        self.settings_list.setStyleSheet(
+            f"QListWidget {{ background: {PANEL}; border: 1px solid {BORDER}; outline: 0; }}"
+            f"QListWidget::item {{ color: {INK}; padding: 8px 12px; }}"
+            f"QListWidget::item:selected {{ background: {ACCENT_SOFT}; color: {ACCENT}; }}"
+        )
+        self.settings_stack = QStackedWidget()
+        for name in ("General", "Interface"):
+            self.settings_list.addItem(name)
+            page, page_layout = frame(None, PANEL, border=True, padx=16, pady=12)
+            page_layout.addWidget(label(page, name, fg=INK, font_spec=("Segoe UI Semibold", 12)))
+            if name == "Interface":
+                page_layout.addSpacing(12)
+                page_layout.addLayout(self._font_size_row())
+            page_layout.addStretch(1)
+            self.settings_stack.addWidget(page)
+        self.settings_list.currentRowChanged.connect(self.settings_stack.setCurrentIndex)
+        self.settings_list.setCurrentRow(0)
+        row.addWidget(self.settings_list)
+        row.addWidget(self.settings_stack, 1)
+
+    # The font size of the whole app, in points of the base text. A size picked from the list applies at once.
+    # A list and not a spin box: a font change moves the whole page, so spin box arrows move away from the mouse after each click.
+    def _font_size_row(self) -> QHBoxLayout:
+        size_row = QHBoxLayout()
+        size_row.setSpacing(8)
+        size_row.addWidget(label(None, "Font size", fg=INK))
+        self.font_size_combo = NoWheelComboBox()
+        self.font_size_combo.setMinimumContentsLength(6)
+        for size in range(FONT_SIZE_RANGE[0], FONT_SIZE_RANGE[1] + 1):
+            self.font_size_combo.addItem(f"{size} pt", size)
+        self.font_size_combo.setCurrentIndex(self.font_size_combo.findData(font_size()))
+        self.font_size_combo.activated.connect(
+            lambda index: set_font_size(QApplication.instance(), self.font_size_combo.itemData(index))
+        )
+        size_row.addWidget(self.font_size_combo)
+        size_row.addStretch(1)
+        return size_row
 
     def _build_setup(self) -> None:
         page = QVBoxLayout(self.setup_page)
@@ -263,7 +318,7 @@ class UnifiedApp:
         toolbar_row.addStretch(1)
 
         adv = QGroupBox(" Advanced ")
-        adv.setFont(tk_default_font())
+        adv.setFont(font(("Segoe UI", 9)))
         adv_layout = QVBoxLayout(adv)
         adv_layout.setContentsMargins(8, 8, 8, 8)
         adv_layout.addWidget(
@@ -1373,6 +1428,11 @@ class UnifiedApp:
         return True
 
 
+# the number boxes of Qt follow the number format of Windows; a Thai format gives Thai digits, so the app uses the English format
+def use_english_numbers() -> None:
+    QLocale.setDefault(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+
+
 def main() -> None:
     silence_opencv()
     parser = argparse.ArgumentParser(description="POC1 Recorder — unified Setup / Record / Library")
@@ -1384,10 +1444,11 @@ def main() -> None:
     if args.slots < 2:
         parser.error("--slots must be >= 2")
     app = QApplication(sys.argv[:1])
+    use_english_numbers()
     ui_bridge.install()
     root = AppWindow()
     UnifiedApp(root, n_slots=args.slots, out_dir=args.out_dir)
-    root.show()
+    root.showMaximized()
     app.exec()
 
 
