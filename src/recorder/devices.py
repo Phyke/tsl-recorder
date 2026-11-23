@@ -1825,6 +1825,10 @@ class ConfiguredRealSenseSource:
         self._wanted = (self.width, self.height, self.target_fps, self.pixel_format)
         # When True, pause SDK bag writer immediately after start (preview pre-arm).
         self.bag_start_paused: bool = False
+        # When True, resume_bag() attaches rs.recorder to the running preview streams.
+        self._attach_pending: bool = False
+        # When True, the .db3 recorder is attached to the running streams (no enable_record_to_file).
+        self._attached: bool = False
         self._depth_enabled: bool = False
         self._depth_raw: Optional[np.ndarray] = None
 
@@ -2148,6 +2152,7 @@ class ConfiguredRealSenseSource:
 
         self._pipeline = pipeline
         self._profile = profile
+        self._listen_notifications(profile)
         self._rs_recorder = None
         if self.bag_path:
             # enable_record_to_file already writes the .bag. as_recorder() is only
@@ -2220,11 +2225,92 @@ class ConfiguredRealSenseSource:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("pause_bag: %s", exc)
 
+    # Write each RealSense notification to the log. The log line has the time when the notification came.
+    # Set after pipeline.start(), so a notification during the start comes only if librealsense keeps it.
+    def _listen_notifications(self, profile: Any) -> None:
+        try:
+            import pyrealsense2 as rs
+
+            for sensor in profile.get_device().query_sensors():
+                name = sensor.get_info(rs.camera_info.name)
+                sensor.set_notifications_callback(
+                    lambda n, name=name: logger.warning(
+                        "RealSense notification: %s: %s (severity %s, category %s, timestamp %.2f)",
+                        name,
+                        n.get_description(),
+                        n.get_severity(),
+                        n.get_category(),
+                        n.get_timestamp(),
+                    )
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not set the RealSense notification callback")
+
+    # Attach: record the running preview streams, with no pipeline stop and start at Record.
+    # The .db3 starts at resume_bag(). False when the preview streams are not the record streams.
+    def attach_bag(self, bag: Path) -> bool:
+        w, h, fps, fmt = self._wanted
+        if self._pipeline is None or self._profile is None or fmt not in {"rgb8", "bgr8", "yuyv"}:
+            return False
+        import pyrealsense2 as rs
+
+        dw, dh = self._depth_size_for(w, h)
+        record_streams = {
+            (rs.stream.color, w, h, fps, self._rs_format(rs, fmt)),
+            (rs.stream.depth, dw, dh, fps, rs.format.z16),
+        }
+        preview_streams = set()
+        for stream in self._profile.get_streams():
+            video = stream.as_video_stream_profile()
+            preview_streams.add((stream.stream_type(), video.width(), video.height(), stream.fps(), stream.format()))
+        if preview_streams != record_streams:
+            logger.info("RealSense attach not used: preview streams %s are not the record streams", preview_streams)
+            return False
+        self.bag_path = bag
+        self._bag_path = bag
+        self._bag_final_path = bag
+        self._rs_recorder = None
+        self.bag_start_paused = True
+        self._attach_pending = True
+        return True
+
     def resume_bag(self) -> None:
+        if self._attach_pending and self._profile is not None:
+            import pyrealsense2 as rs
+
+            self._rs_recorder = rs.recorder(str(self.bag_path), self._profile.get_device())
+            self._attach_pending = False
+            self._attached = True
+            self.bag_start_paused = False
+            logger.info("RealSense .db3 attached to the running streams -> %s", self.bag_path)
+            return
         if self._rs_recorder is None:
             raise RuntimeError("No RealSense .bag recorder is armed")
         self._rs_recorder.resume()
         self.bag_start_paused = False
+
+    # Attach: close the .db3 by the release of rs.recorder, and keep the preview streams on.
+    # False when no recorder is attached, or when no frame comes after the release.
+    def detach_bag(self) -> bool:
+        if not self._attached:
+            return False
+        self._attached = False
+        self._rs_recorder = None
+        self.bag_start_paused = False
+        arrived = 0
+        try:
+            # 3 framesets, so a frameset that waited in the queue before the release is not enough
+            while arrived < 3 and self._pipeline.try_wait_for_frames(2000)[0]:
+                arrived += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("RealSense frame check after the recorder release failed")
+        if arrived < 3:
+            logger.warning("RealSense: %d of 3 framesets after the recorder release; the preview restarts", arrived)
+            return False
+        logger.info("RealSense .db3 closed; the preview streams stay on")
+        # The attached recorder can replace the callback of the sensors, so set it again.
+        self._listen_notifications(self._profile)
+        return True
 
     def stop(self) -> None:
         if self._pipeline is not None:
@@ -2235,6 +2321,8 @@ class ConfiguredRealSenseSource:
             self._pipeline = None
         self._profile = None
         self._rs_recorder = None
+        self._attach_pending = False
+        self._attached = False
         self._pending_frame = None
         self._depth_raw = None
         self._depth_enabled = False

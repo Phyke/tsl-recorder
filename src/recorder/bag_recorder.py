@@ -164,6 +164,17 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
             "Run: uv sync --extra realsense"
         ) from exc
 
+    # Attach to the running preview streams when they are the record streams: no stop and no start at Record.
+    attach = getattr(source, "attach_bag", None)
+    if callable(attach):
+        attached = coerce_record_path(Path(bag_path)).resolve()
+        attached.parent.mkdir(parents=True, exist_ok=True)
+        if attach(attached):
+            if attached.is_file():
+                attached.unlink()
+            logger.info("RealSense record armed (attach, no restart) -> %s", attached)
+            return attached
+
     wanted = _wanted_from_source(source)
     last_exc: Optional[BaseException] = None
     candidates = paths_to_try(Path(bag_path))
@@ -296,6 +307,7 @@ def stop_bag_recording(source: Any) -> Optional[Path]:
         return None
 
     wanted = _wanted_from_source(source)
+    detached = False
     try:
         if hasattr(source, "pause_bag"):
             try:
@@ -306,21 +318,26 @@ def stop_bag_recording(source: Any) -> Optional[Path]:
             # pipeline is torn down. Stopping immediately drops that tail,
             # so the MP4 (still draining its queue) ends up longer than the .db3.
             time.sleep(0.15)
-        source.stop()
+        # Attach: the release of the recorder closes the .db3, and the preview streams stay on.
+        detach = getattr(source, "detach_bag", None)
+        detached = bool(callable(detach) and detach())
+        if not detached:
+            source.stop()
     except Exception:  # noqa: BLE001
         pass
 
     clear_bag_on_source(source)
-    time.sleep(0.4)
-    _restore_wanted(source, wanted)
-    try:
-        _call_start(source, allow_fallback=False)
-    except Exception:
+    if not detached:
+        time.sleep(0.4)
+        _restore_wanted(source, wanted)
         try:
-            _restore_wanted(source, wanted)
-            _call_start(source, allow_fallback=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("RealSense preview restart after record failed: %s", exc)
+            _call_start(source, allow_fallback=False)
+        except Exception:
+            try:
+                _restore_wanted(source, wanted)
+                _call_start(source, allow_fallback=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("RealSense preview restart after record failed: %s", exc)
 
     out = Path(final) if final is not None else Path(path)
     if out.exists() and out.stat().st_size > 0:
