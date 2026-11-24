@@ -12,12 +12,20 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import cv2
 import numpy as np
 
 from recorder.config import settings
+from recorder.device_enum import quiet_opencv
+from recorder.frame_source import FakeFrameSource
+from recorder.pipeline import CvCaptureSource
+from recorder.realsense_source import (
+    create_realsense_source,
+    list_realsense_devices,
+    realsense_available,
+)
 from recorder.win_names import (
     classify_capture_name,
     clear_name_cache,
@@ -28,15 +36,6 @@ from recorder.win_names import (
     friendly_name_for_index,
     is_laptop_webcam,
     list_windows_capture_names,
-    names_are_index_aligned,
-)
-from recorder.device_enum import quiet_opencv
-from recorder.frame_source import FakeFrameSource
-from recorder.pipeline import CvCaptureSource
-from recorder.realsense_source import (
-    create_realsense_source,
-    list_realsense_devices,
-    realsense_available,
 )
 
 logger = logging.getLogger("poc1.d1.devices")
@@ -69,12 +68,12 @@ class ConnectedCamera:
     cam_id: str
     kind: str  # "uvc" | "realsense" | "fake"
     name: str
-    index: Optional[int] = None
-    serial: Optional[str] = None
-    backend: Optional[int] = None
+    index: int | None = None
+    serial: str | None = None
+    backend: int | None = None
     backend_name: str = ""
     # Windows DirectShow path, e.g. "video=Elgato HD60 S+" (more reliable than index).
-    open_path: Optional[str] = None
+    open_path: str | None = None
     device_tag: str = "uvc"  # elgato | realsense-uvc | virtual | uvc | realsense | fake
 
     def label(self) -> str:
@@ -120,14 +119,14 @@ class StreamMode:
         return f"{self.width}x{self.height}@{self.fps} {self.pixel_format}{kind}"
 
 
-def is_fhd_high_rate(mode: Optional[StreamMode]) -> bool:
+def is_fhd_high_rate(mode: StreamMode | None) -> bool:
     """True for 1920x1080 (or larger) at >=90 fps — Elgato/fake 120, not RealSense @30."""
     if mode is None:
         return False
-    return int(mode.width) >= 1920 and int(mode.height) >= 1080 and int(mode.fps) >= 90
+    return int(mode.width) >= 1920 and int(mode.height) >= 1080 and int(mode.fps) >= settings.high_rate_fps
 
 
-def too_many_1080p120(modes: list[Optional[StreamMode]]) -> bool:
+def too_many_1080p120(modes: list[StreamMode | None]) -> bool:
     """Two or more 1080p@≥90 encodes in one take — refuse. One 120 + @30/@60 is OK."""
     return sum(1 for m in modes if is_fhd_high_rate(m)) >= 2
 
@@ -141,15 +140,15 @@ def honest_container_fps(rate: float, requested: int) -> int:
     """
     req = int(requested) if int(requested or 0) > 0 else 30
     r = float(rate or 0.0)
-    if r < 5.0:
-        return 30 if req >= 90 else max(15, min(req, 60))
+    if r < settings.min_live_fps:
+        return 30 if req >= settings.high_rate_fps else max(15, min(req, 60))
 
     # True / settling high-rate (OBS-like 120). Open-time samples often land
     # ~95 briefly while live delivery is already climbing to ~120 — stamp req.
-    if req >= 90 and r >= 90.0:
+    if req >= settings.high_rate_fps and r >= settings.high_rate_fps:
         return req
     if 100.0 <= r <= 130.0:
-        return 120 if req >= 90 else min(req, 120)
+        return 120 if req >= settings.high_rate_fps else min(req, 120)
 
     # HDMI / NTSC ~60 — includes short-window undercounts that used to become 55.
     if 48.0 <= r <= 63.0:
@@ -163,7 +162,7 @@ def honest_container_fps(rate: float, requested: int) -> int:
 
     stamped = int(round(r / 5.0) * 5) or 30
     stamped = max(15, stamped)
-    if req >= 90:
+    if req >= settings.high_rate_fps:
         return min(stamped, req)
     return stamped
 
@@ -190,7 +189,7 @@ def elgato_open_profiles(
         (w, h, 50, "mjpg"),
         (w, h, 30, "mjpg"),
     ]
-    if fps >= 90:
+    if fps >= settings.high_rate_fps:
         profiles = primary + same_res_high + same_res_mid
     else:
         profiles = primary + same_res_mid + same_res_high
@@ -238,7 +237,7 @@ def _uvc_display_name(
     fps: float,
     *,
     busy: bool = False,
-) -> tuple[str, str, Optional[str]]:
+) -> tuple[str, str, str | None]:
     """Return (display_name, device_tag, open_path)."""
     fallback = f"UVC #{index} ({w}x{h}" + (f"@{fps:.0f}" if fps > 0 else "") + ")"
     friendly, tag = friendly_name_for_index(index, fallback)
@@ -300,9 +299,9 @@ def _make_uvc_camera(
     h: int = 480,
     fps: float = 0.0,
     busy: bool = False,
-    open_path: Optional[str] = None,
-    name: Optional[str] = None,
-    device_tag: Optional[str] = None,
+    open_path: str | None = None,
+    name: str | None = None,
+    device_tag: str | None = None,
 ) -> ConnectedCamera:
     disp, tag, path = _uvc_display_name(index, w, h, fps, busy=busy)
     return ConnectedCamera(
@@ -317,7 +316,7 @@ def _make_uvc_camera(
     )
 
 
-def _probe_uvc_index(index: int, backend: int, backend_name: str) -> Optional[ConnectedCamera]:
+def _probe_uvc_index(index: int, backend: int, backend_name: str) -> ConnectedCamera | None:
     with quiet_opencv():
         cap = cv2.VideoCapture(index, backend)
         if not cap.isOpened():
@@ -341,7 +340,7 @@ def _probe_uvc_index_safe(
     backend: int,
     backend_name: str,
     timeout_s: float = 2.0,
-) -> tuple[Optional[ConnectedCamera], str]:
+) -> tuple[ConnectedCamera | None, str]:
     """
     OpenCV can hang when another process owns the camera; bound the wait.
 
@@ -592,7 +591,7 @@ def pick_auto_camera_for_slot(
     slot_id: int,
     devices: list[ConnectedCamera],
     used_cam_ids: set[str],
-) -> Optional[ConnectedCamera]:
+) -> ConnectedCamera | None:
     """Slot 0 → RealSense, slot 1 → Elgato when both are in the device list."""
     slot_order: dict[int, tuple[str, ...]] = {
         0: ("realsense", "uvc", "fake"),
@@ -637,7 +636,7 @@ def _rs_format_name(fmt: Any) -> str:
         return "unknown"
 
 
-def list_realsense_modes(serial: Optional[str] = None) -> list[StreamMode]:
+def list_realsense_modes(serial: str | None = None) -> list[StreamMode]:
     """Station color modes only.
 
     The D435 advertises well over a hundred profiles. The dropdown keeps the
@@ -786,9 +785,7 @@ def _frame_is_unusable_elgato(bgr: np.ndarray) -> bool:
     spatial = float(max(float(np.std(bgr[:, :, c])) for c in range(3)))
     if spatial < 8.0 and float(np.mean(bgr[:, :, 1])) > 120.0:
         return True
-    if _looks_like_solid_green(bgr):
-        return True
-    return False
+    return bool(_looks_like_solid_green(bgr))
 
 
 def _open_uvc_timeout(target: Any, backend: int, timeout_s: float = 3.0) -> cv2.VideoCapture:
@@ -816,7 +813,7 @@ def _open_uvc_timeout(target: Any, backend: int, timeout_s: float = 3.0) -> cv2.
 
 
 def _elgato_open_targets(
-    open_path: Optional[str],
+    open_path: str | None,
     device_index: int,
     *,
     max_index: int = 8,
@@ -863,7 +860,7 @@ def _uvc_open_failure_message(
     *,
     is_elgato: bool,
     opened_once: bool,
-    last_exc: Optional[BaseException],
+    last_exc: BaseException | None,
 ) -> str:
     """Distinguish could-not-open vs opened-but-no-frames for Station A dialogs."""
     detail = f" ({last_exc})" if last_exc else ""
@@ -928,7 +925,7 @@ class FormattedUvcSource(CvCaptureSource):
         fps: int,
         backend,
         pixel_format: str = "bgr8",
-        open_path: Optional[str] = None,
+        open_path: str | None = None,
         device_tag: str = "uvc",
     ):
         safe_fps = fps if fps > 0 else 30
@@ -936,7 +933,7 @@ class FormattedUvcSource(CvCaptureSource):
         self.pixel_format = pixel_format
         self.open_path = open_path
         self.device_tag = device_tag
-        self._pending_frame: Optional[np.ndarray] = None
+        self._pending_frame: np.ndarray | None = None
         self._ffmpeg = None
 
     def _activate_ffmpeg_dshow(
@@ -1094,11 +1091,11 @@ class FormattedUvcSource(CvCaptureSource):
         height: int,
         fps: int,
         pixel_format: str,
-    ) -> Optional[np.ndarray]:
+    ) -> np.ndarray | None:
         # OBS-like DirectShow order for Elgato: MJPG → size → FPS (repeated).
         # High-rate needs a deeper driver buffer so dual-cam Record does not starve.
         is_elgato = getattr(self, "device_tag", "") == "elgato"
-        if is_elgato and fps >= 90:
+        if is_elgato and fps >= settings.high_rate_fps:
             return self._elgato_configure_obs_pin(cap, width, height, fps)
         fmt = pixel_format
         _apply_uvc_fourcc(cap, fmt)
@@ -1126,7 +1123,7 @@ class FormattedUvcSource(CvCaptureSource):
         width: int,
         height: int,
         fps: int,
-    ) -> Optional[np.ndarray]:
+    ) -> np.ndarray | None:
         """Force OBS-equivalent Custom WxH @ fps MJPEG pin (multiple property orders)."""
         mjpg = cv2.VideoWriter_fourcc(*"MJPG")
         sequences: list[list[tuple[str, float | int]]] = [
@@ -1155,7 +1152,7 @@ class FormattedUvcSource(CvCaptureSource):
                 ("fps", fps),
             ],
         ]
-        best: Optional[np.ndarray] = None
+        best: np.ndarray | None = None
         for seq_i, seq in enumerate(sequences):
             for key, val in seq:
                 try:
@@ -1206,9 +1203,9 @@ class FormattedUvcSource(CvCaptureSource):
                 return frame
             # Driver still stuck at ~60 while we asked ≥90 — try next property order.
             # Do NOT accept size-only for high-rate (that locked 1080@60 and stamped 60).
-            if fps >= 90 and got_fps > 0 and got_fps < fps * 0.85:
+            if fps >= settings.high_rate_fps and got_fps > 0 and got_fps < fps * 0.85:
                 continue
-            if size_ok and fps < 90:
+            if size_ok and fps < settings.high_rate_fps:
                 return frame
         return best
 
@@ -1270,7 +1267,7 @@ class FormattedUvcSource(CvCaptureSource):
             self.requested_fps = wanted_fps
             wanted_fmt = (self.pixel_format or "bgr8").lower()
             is_elgato = self.device_tag == "elgato"
-            want_high = is_elgato and wanted_fps >= 90
+            want_high = is_elgato and wanted_fps >= settings.high_rate_fps
 
             # ffmpeg DirectShow first for 1080p120 — same pin OBS uses. OpenCV often
             # soft-opens ~60 even when HDMI is 120 (v28 measured ~58, stamped 60).
@@ -1310,21 +1307,17 @@ class FormattedUvcSource(CvCaptureSource):
                     seen_p.add(prof)
                     unique_profiles.append(prof)
 
-            last_exc: Optional[Exception] = None
+            last_exc: Exception | None = None
             opened_once = False
-            chosen: Optional[
-                tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray]
-            ] = None
-            best_effort: Optional[
-                tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray]
-            ] = None
-            want_high = is_elgato and wanted_fps >= 90
+            chosen: tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray] | None = None
+            best_effort: tuple[float, int, int, int, str, cv2.VideoCapture, np.ndarray] | None = None
+            want_high = is_elgato and wanted_fps >= settings.high_rate_fps
             # Same resolution only — never silently accept 720 when operator picked 1080.
             high_only = (
                 [
                     p
                     for p in unique_profiles
-                    if p[2] >= 90 and p[0] == wanted_w and p[1] == wanted_h
+                    if p[2] >= settings.high_rate_fps and p[0] == wanted_w and p[1] == wanted_h
                 ]
                 if want_high
                 else unique_profiles
@@ -1461,7 +1454,7 @@ class FormattedUvcSource(CvCaptureSource):
                             wanted_fps,
                         )
                         continue
-                    if is_elgato and fps >= 90:
+                    if is_elgato and fps >= settings.high_rate_fps:
                         measured = self._elgato_measure_high_rate(cap, fps)
                     else:
                         measured = 0.0
@@ -1489,7 +1482,7 @@ class FormattedUvcSource(CvCaptureSource):
                     )
                     # Real / settling 120 lock: accept when delivery is already high-rate
                     # (>=90). Do not require a perfect 102 sample (that caused 95 stamps).
-                    if fps >= 90 and rate >= 90.0:
+                    if fps >= settings.high_rate_fps and rate >= settings.high_rate_fps:
                         chosen = candidate
                         accepted_here = True
                         logger.info(
@@ -1501,7 +1494,7 @@ class FormattedUvcSource(CvCaptureSource):
                         )
                         break
                     # Soft ~60 while asking 120: keep searching; remember best effort.
-                    if want_high and fps >= 90 and rate < 90.0:
+                    if want_high and fps >= settings.high_rate_fps and rate < settings.high_rate_fps:
                         if best_effort is None or rate > best_effort[0]:
                             if (
                                 best_effort is not None
@@ -1610,7 +1603,7 @@ class FormattedUvcSource(CvCaptureSource):
                         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
                         if w < int(wanted_w * 0.9) or h < int(wanted_h * 0.9):
                             continue
-                        if rate >= 90.0:
+                        if rate >= settings.high_rate_fps:
                             chosen = (rate, w, h, fps, fmt, cap, owned)
                             locked_here = True
                             logger.info(
@@ -1642,9 +1635,9 @@ class FormattedUvcSource(CvCaptureSource):
                     from recorder.ffmpeg_dshow_source import find_ffmpeg
 
                     be_rate = float(best_effort[0])
-                    if be_rate >= 90.0 or not find_ffmpeg():
+                    if be_rate >= settings.high_rate_fps or not find_ffmpeg():
                         chosen = best_effort
-                        if be_rate < 90.0:
+                        if be_rate < settings.high_rate_fps:
                             logger.warning(
                                 "Elgato soft-open at ~%.1ffps (ffmpeg missing; "
                                 "install ffmpeg for 1080p120)",
@@ -1685,7 +1678,7 @@ class FormattedUvcSource(CvCaptureSource):
                 )
 
             rate, w, h, req_fps, fmt, cap, frame = chosen
-            if want_high and rate < 90.0:
+            if want_high and rate < settings.high_rate_fps:
                 try:
                     cap.release()
                 except Exception:  # noqa: BLE001
@@ -1716,7 +1709,7 @@ class FormattedUvcSource(CvCaptureSource):
             self.actual_height = h
             self._pending_frame = frame
 
-            if is_elgato and (req_fps >= 90 or want_high):
+            if is_elgato and (req_fps >= settings.high_rate_fps or want_high):
                 stamp_req = wanted_fps if want_high else req_fps
                 stamped = honest_container_fps(rate, stamp_req)
                 if stamped < stamp_req * 0.85:
@@ -1740,7 +1733,7 @@ class FormattedUvcSource(CvCaptureSource):
             else:
                 self.target_fps = (
                     honest_container_fps(rate, req_fps)
-                    if is_elgato and rate > 5
+                    if is_elgato and rate > settings.min_live_fps
                     else (req_fps if req_fps > 0 else 30)
                 )
 
@@ -1753,7 +1746,7 @@ class FormattedUvcSource(CvCaptureSource):
             )
         self._log_d1_uvc_start()
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self) -> np.ndarray | None:
         if self._ffmpeg is not None:
             return self._ffmpeg.read()
         if self._pending_frame is not None:
@@ -1800,14 +1793,14 @@ class ConfiguredRealSenseSource:
         self.actual_fps = float(self.target_fps)
         self.actual_width = width
         self.actual_height = height
-        self.bag_path: Optional[Any] = None
-        self._bag_path: Optional[Any] = None
-        self._bag_final_path: Optional[Any] = None
-        self._pipeline: Optional[Any] = None
-        self._profile: Optional[Any] = None
-        self._rs_recorder: Optional[Any] = None
-        self._pending_frame: Optional[np.ndarray] = None
-        self._colorizer: Optional[Any] = None
+        self.bag_path: Any | None = None
+        self._bag_path: Any | None = None
+        self._bag_final_path: Any | None = None
+        self._pipeline: Any | None = None
+        self._profile: Any | None = None
+        self._rs_recorder: Any | None = None
+        self._pending_frame: np.ndarray | None = None
+        self._colorizer: Any | None = None
         self._wanted = (self.width, self.height, self.target_fps, self.pixel_format)
         # When True, pause SDK bag writer immediately after start (preview pre-arm).
         self.bag_start_paused: bool = False
@@ -1816,7 +1809,7 @@ class ConfiguredRealSenseSource:
         # When True, the .db3 recorder is attached to the running streams (no enable_record_to_file).
         self._attached: bool = False
         self._depth_enabled: bool = False
-        self._depth_raw: Optional[np.ndarray] = None
+        self._depth_raw: np.ndarray | None = None
 
     @staticmethod
     def _rs_format(rs, name: str):
@@ -1926,7 +1919,7 @@ class ConfiguredRealSenseSource:
             config.enable_device(self.serial)
         fmt = pixel_format.lower()
         # Bag record is a fixed dual stream so the file has Color_0 and Depth_0.
-        if self.bag_path and fmt not in {"y8"}:
+        if self.bag_path and fmt != "y8":
             self._enable_bag_color_depth(rs, config, width, height, fps, fmt)
             self._depth_enabled = True
         elif fmt == "z16":
@@ -1968,7 +1961,7 @@ class ConfiguredRealSenseSource:
                 bag.unlink(missing_ok=True)
             try:
                 config.enable_record_to_file(str(bag))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 msg = str(exc).lower()
                 if "db3" in msg and bag.suffix.lower() != ".db3":
                     set_recording_suffix(".db3")
@@ -2059,11 +2052,11 @@ class ConfiguredRealSenseSource:
                         height,
                         try_fps,
                         try_fmt,
-                        with_depth=True if (self.bag_path or depth_preview) else False,
+                        with_depth=bool(self.bag_path or depth_preview),
                     )
-                except Exception as depth_exc:
+                except Exception:
                     if not depth_preview:
-                        raise depth_exc
+                        raise
                     pipeline, profile = self._start_profile(
                         rs, width, height, try_fps, try_fmt, with_depth=False
                     )
@@ -2119,7 +2112,7 @@ class ConfiguredRealSenseSource:
             self.actual_width = self.width
             self.actual_height = self.height
             self.actual_fps = float(self.target_fps)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.stop()
             raise RuntimeError(f"Could not read RealSense stream profile: {exc}") from exc
 
@@ -2170,7 +2163,7 @@ class ConfiguredRealSenseSource:
                 )
 
         try:
-            first: Optional[np.ndarray] = None
+            first: np.ndarray | None = None
             for _ in range(8):
                 frames = pipeline.wait_for_frames(timeout_ms=3000)
                 self._stash_depth(frames)
@@ -2229,7 +2222,7 @@ class ConfiguredRealSenseSource:
                         n.get_timestamp(),
                     )
                 )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("Could not set the RealSense notification callback")
 
     # Attach: record the running preview streams, with no pipeline stop and start at Record.
@@ -2288,7 +2281,7 @@ class ConfiguredRealSenseSource:
             # 3 framesets, so a frameset that waited in the queue before the release is not enough
             while arrived < 3 and self._pipeline.try_wait_for_frames(2000)[0]:
                 arrived += 1
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("RealSense frame check after the recorder release failed")
         if arrived < 3:
             logger.warning("RealSense: %d of 3 framesets after the recorder release; the preview restarts", arrived)
@@ -2314,7 +2307,7 @@ class ConfiguredRealSenseSource:
         self._depth_enabled = False
         self._colorizer = None
 
-    def _frames_to_bgr(self, frames: Any) -> Optional[np.ndarray]:
+    def _frames_to_bgr(self, frames: Any) -> np.ndarray | None:
         if self.pixel_format == "z16":
             depth = frames.get_depth_frame()
             if not depth:
@@ -2376,7 +2369,7 @@ class ConfiguredRealSenseSource:
         self._pending_frame = None
         if self._pipeline is None:
             return
-        latest: Optional[np.ndarray] = None
+        latest: np.ndarray | None = None
         deadline = time.perf_counter() + 0.25
         while time.perf_counter() < deadline:
             try:
@@ -2397,7 +2390,7 @@ class ConfiguredRealSenseSource:
                 latest = None
         self._pending_frame = latest
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self) -> np.ndarray | None:
         if self._pending_frame is not None:
             frame = self._pending_frame
             self._pending_frame = None

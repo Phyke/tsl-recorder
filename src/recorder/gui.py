@@ -14,8 +14,8 @@ import os
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 import numpy as np
 from pydantic import ValidationError
@@ -41,21 +41,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from recorder import ui_bridge
 from recorder.cards import CameraCard
 from recorder.config import load_settings, save_settings, settings
 from recorder.devices import (
     PreviewOpenCancelled,
     clear_preview_cancel,
+    is_fhd_high_rate,
     request_preview_cancel,
-)
-from recorder.user_messages import (
-    bag_file_missing,
-    capture_not_120_status,
-    no_frames_captured_message,
-    preview_failed_message,
+    too_many_1080p120,
 )
 from recorder.library import LibraryPage
 from recorder.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud
+from recorder.quiet import configure_app_logging, silence_opencv
+from recorder.review import show_review_prompt
+from recorder.session import MultiCamSession
 from recorder.theme import (
     ACCENT,
     ACCENT_SOFT,
@@ -80,12 +80,13 @@ from recorder.theme import (
     show_text,
     text_size,
 )
-from recorder.session import MultiCamSession
-from recorder.devices import is_fhd_high_rate, too_many_1080p120
-from recorder.review import show_review_prompt
-from recorder.quiet import configure_app_logging, silence_opencv
-from recorder import ui_bridge
 from recorder.ui_bridge import call_in_ui
+from recorder.user_messages import (
+    bag_file_missing,
+    capture_not_120_status,
+    no_frames_captured_message,
+    preview_failed_message,
+)
 
 configure_app_logging()
 logger = logging.getLogger("poc1.app")
@@ -111,7 +112,7 @@ def _margin(widget: QWidget, left: int, top: int, right: int, bottom: int) -> QW
 class AppWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.close_handler: Optional[Callable[[], bool]] = None
+        self.close_handler: Callable[[], bool] | None = None
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if self.close_handler is not None and not self.close_handler():
@@ -122,7 +123,7 @@ class AppWindow(QMainWindow):
 
 # The mouse wheel scrolls the Setup cards from anywhere on the Setup page (Tk bind_all("<MouseWheel>")).
 class _WheelFilter(QObject):
-    def __init__(self, app: "UnifiedApp") -> None:
+    def __init__(self, app: UnifiedApp) -> None:
         super().__init__()
         self.app = app
 
@@ -542,10 +543,10 @@ class UnifiedApp:
 
         def worker() -> None:
             devices: list = []
-            error: Optional[str] = None
+            error: str | None = None
             try:
                 devices = self.session.refresh_devices(include_fake=True)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.exception("camera refresh failed")
                 error = str(exc)
             call_in_ui(
@@ -557,7 +558,7 @@ class UnifiedApp:
         threading.Thread(target=worker, name="app-refresh-cameras", daemon=True).start()
 
     def _refresh_cameras_done(
-        self, devices: list, error: Optional[str], initial: bool
+        self, devices: list, error: str | None, initial: bool
     ) -> None:
         self._set_busy(False)
         if error:
@@ -644,19 +645,19 @@ class UnifiedApp:
                 show_text(card.preview, "Opening camera…")
 
         def worker() -> None:
-            error: Optional[str] = None
+            error: str | None = None
             cancelled = False
             try:
                 self.session.start_previews()
             except PreviewOpenCancelled:
                 cancelled = True
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.exception("start_previews failed")
                 error = str(exc)
             if cancelled:
                 try:
                     self.session.stop_previews()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("stop after cancel failed")
             call_in_ui(
                 lambda err=error, was_cancelled=cancelled: self._previews_started(
@@ -682,19 +683,19 @@ class UnifiedApp:
             pass
 
         def worker() -> None:
-            error: Optional[str] = None
+            error: str | None = None
             cancelled = False
             try:
                 self.session.start_slot_preview(slot_id)
             except PreviewOpenCancelled:
                 cancelled = True
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.exception("start_slot_preview failed")
                 error = str(exc)
             if cancelled:
                 try:
                     self.session.stop_slot_preview(slot_id)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("stop slot after cancel failed")
             call_in_ui(
                 lambda err=error, sid=slot_id, was_cancelled=cancelled: self._slot_preview_started(
@@ -706,7 +707,7 @@ class UnifiedApp:
             target=worker, name=f"app-preview-slot{slot_id}", daemon=True
         ).start()
 
-    def _previews_started(self, error: Optional[str], cancelled: bool = False) -> None:
+    def _previews_started(self, error: str | None, cancelled: bool = False) -> None:
         self._set_busy(False)
         clear_preview_cancel()
         self._clear_opening_placeholders()
@@ -745,7 +746,7 @@ class UnifiedApp:
         self.refresh_record_gate()
 
     def _slot_preview_started(
-        self, slot_id: int, error: Optional[str], cancelled: bool = False
+        self, slot_id: int, error: str | None, cancelled: bool = False
     ) -> None:
         self._set_busy(False)
         clear_preview_cancel()
@@ -859,7 +860,7 @@ class UnifiedApp:
             line = (
                 f"{slot.prefix}: requested {requested} fps, delivering ~{measured:.0f}"
             )
-            if requested >= 90 and measured < requested * 0.85:
+            if requested >= settings.high_rate_fps and measured < requested * 0.85:
                 line += (
                     f" ({capture_not_120_status(requested, measured, stamp)})"
                 )
@@ -923,7 +924,7 @@ class UnifiedApp:
     def _tick_record_tiles(self) -> None:
         if len(self._record_tiles) != len(self.session.slots):
             return
-        for slot, tile in zip(self.session.slots, self._record_tiles):
+        for slot, tile in zip(self.session.slots, self._record_tiles, strict=False):
             frame_bgr = slot.get_preview_frame()
             if frame_bgr is None:
                 continue
@@ -944,7 +945,7 @@ class UnifiedApp:
                         rgb = np.concatenate([left, right], axis=1)
                 else:
                     rgb = bgr_to_rgb_fill(frame_bgr, tw, th)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("record tile draw failed")
                 continue
             if src is not None:
@@ -1053,17 +1054,17 @@ class UnifiedApp:
 
         def worker() -> None:
             paths: list[Path] = []
-            error: Optional[str] = None
+            error: str | None = None
             try:
                 paths = self.session.start_recording_armed(bag_intent=bag_intent)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.exception("record start failed")
                 error = str(exc)
             call_in_ui(lambda: self._record_started(paths, error))
 
         threading.Thread(target=worker, name="app-record-start", daemon=True).start()
 
-    def _record_started(self, paths: list[Path], error: Optional[str]) -> None:
+    def _record_started(self, paths: list[Path], error: str | None) -> None:
         if error:
             self._set_busy(False)
             for card in self.cards:
@@ -1117,10 +1118,10 @@ class UnifiedApp:
 
         def worker() -> None:
             reports: dict = {}
-            error: Optional[str] = None
+            error: str | None = None
             try:
                 reports = self.session.stop_recording_armed()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.exception("record stop failed")
                 error = str(exc)
             call_in_ui(lambda: self._record_stopped(reports, error))
@@ -1128,7 +1129,7 @@ class UnifiedApp:
         threading.Thread(target=worker, name="app-record-stop", daemon=True).start()
 
     def _record_stopped(
-        self, reports: dict[str, dict], error: Optional[str] = None
+        self, reports: dict[str, dict], error: str | None = None
     ) -> None:
         self._stopping = False
         self.last_reports = reports
@@ -1292,7 +1293,7 @@ class UnifiedApp:
             show_review_prompt(
                 self.root,
                 saved,
-                on_review=lambda p: self.show_library(p),
+                on_review=self.show_library,
                 review_label="Open in Library",
             )
 
@@ -1307,7 +1308,7 @@ class UnifiedApp:
                     results[slot.prefix] = bool(
                         slot.pipeline and slot.pipeline.convert_container_fps()
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("FPS conversion failed for %s", slot.prefix)
                     results[slot.prefix] = False
             call_in_ui(lambda: self._conversion_done(results))
@@ -1426,12 +1427,12 @@ class UnifiedApp:
             for card in self.cards:
                 try:
                     card.tick()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("preview tick failed for slot %s", getattr(card, "slot_id", "?"))
         elif page is self.record_page:
             try:
                 self._tick_record_tiles()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("record preview tick failed")
             if self.session.is_recording:
                 extra = self._elgato_live_lines()
@@ -1466,7 +1467,7 @@ class UnifiedApp:
             pass
         try:
             self.session.shutdown()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("shutdown failed")
         try:
             QApplication.instance().removeEventFilter(self._wheel_filter)
@@ -1483,7 +1484,12 @@ def use_english_numbers() -> None:
 def main() -> None:
     silence_opencv()
     parser = argparse.ArgumentParser(description="POC1 Recorder — unified Setup / Record / Library")
-    parser.add_argument("--slots", type=int, default=None, help="Initial camera slots (>=2); default: the Camera slots at start setting")
+    parser.add_argument(
+        "--slots",
+        type=int,
+        default=None,
+        help=f"Initial camera slots (>={settings.camera_slot_range[0]}); default: the Camera slots at start setting",
+    )
     parser.add_argument("--out-dir", type=Path, default=None, help="Save folder; default: the last Save folder")
     args = parser.parse_args()
     # A bad settings.json does not stop the start: the app uses the defaults and names each bad key.
@@ -1495,8 +1501,8 @@ def main() -> None:
         logger.warning("Bad settings file %s, the defaults are used: %s", settings.settings_path, settings_error)
     # A value on the command line comes first, then the saved setting, then the default.
     slots = args.slots if args.slots is not None else settings.camera_slots
-    if slots < 2:
-        parser.error("--slots must be >= 2")
+    if slots < settings.camera_slot_range[0]:
+        parser.error(f"--slots must be >= {settings.camera_slot_range[0]}")
     out_dir = args.out_dir or (Path(settings.save_folder) if settings.save_folder else settings.default_save_folder)
     app = QApplication(sys.argv[:1])
     use_english_numbers()

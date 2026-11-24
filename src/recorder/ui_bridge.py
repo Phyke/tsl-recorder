@@ -1,7 +1,7 @@
 """Run a function on the Qt UI thread from any thread (the PySide6 form of root.after(0, fn))."""
 from __future__ import annotations
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 
@@ -18,7 +18,7 @@ class _Dispatcher(QObject):
         fn()
 
 
-_dispatcher: Optional[_Dispatcher] = None
+_dispatcher: _Dispatcher | None = None
 
 
 # Call once on the UI thread, after QApplication exists.

@@ -4,13 +4,15 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from recorder.config import settings
+
 PIPE_BGR24 = "bgr24"
 PIPE_NV12 = "nv12"
 
 
 def pipe_pix_fmt_for_fps(target_fps: int) -> str:
     """High-rate Elgato: NV12 halves pipe bandwidth vs BGR24."""
-    return PIPE_NV12 if int(target_fps) >= 90 else PIPE_BGR24
+    return PIPE_NV12 if int(target_fps) >= settings.high_rate_fps else PIPE_BGR24
 
 
 def frame_bytes(width: int, height: int, pipe_pix_fmt: str) -> int:

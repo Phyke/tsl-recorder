@@ -12,14 +12,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
 
 import numpy as np
 
-from recorder.config import settings
-from recorder.preview_draw import colorize_depth_preview, downscale_for_preview
 from recorder.bag_recorder import clear_bag_on_source, with_sdk_record_suffix
 from recorder.camera_handler import FrameEnvelope
+from recorder.config import settings
 from recorder.devices import (
     ConnectedCamera,
     PreviewOpenCancelled,
@@ -31,6 +29,7 @@ from recorder.devices import (
     preview_cancel_requested,
 )
 from recorder.pipeline import Pipeline
+from recorder.preview_draw import colorize_depth_preview, downscale_for_preview
 
 logger = logging.getLogger("poc1.d1.session")
 
@@ -48,12 +47,12 @@ class CameraSlot:
     slot_id: int
     prefix: str = "cam1"
     armed: bool = True
-    camera: Optional[ConnectedCamera] = None
-    mode: Optional[StreamMode] = None
+    camera: ConnectedCamera | None = None
+    mode: StreamMode | None = None
     available_modes: list[StreamMode] = field(default_factory=list)
-    pipeline: Optional[Pipeline] = None
-    last_frame: Optional[object] = None  # numpy array
-    last_depth_frame: Optional[object] = None
+    pipeline: Pipeline | None = None
+    last_frame: object | None = None  # numpy array
+    last_depth_frame: object | None = None
     last_report: dict = field(default_factory=dict)
     status: str = "idle"
     record_bag: bool = False
@@ -98,7 +97,7 @@ class CameraSlot:
                 return None
             return self.last_depth_frame
 
-    def estimate_preview_fps(self) -> Optional[float]:
+    def estimate_preview_fps(self) -> float | None:
         """Recent live preview rate (informational only — never changes record stamp)."""
         with self._frame_lock:
             stamps = list(self._preview_ts)
@@ -125,8 +124,8 @@ class MultiCamSession:
         n_slots: int = 2,
         out_dir: Path | str = Path("./recordings/deliverable1"),
     ) -> None:
-        if n_slots < 2:
-            raise ValueError("Deliverable 1 requires at least 2 camera slots (R3)")
+        if n_slots < settings.camera_slot_range[0]:
+            raise ValueError(f"Deliverable 1 requires at least {settings.camera_slot_range[0]} camera slots (R3)")
         self.out_dir = Path(out_dir)
         self.devices: list[ConnectedCamera] = []
         self.slots: list[CameraSlot] = [
@@ -168,8 +167,8 @@ class MultiCamSession:
         """Remove a camera lane while retaining the R3 minimum of two."""
         if self._recording:
             raise RuntimeError("Stop recording before removing a camera slot")
-        if len(self.slots) <= 2:
-            raise RuntimeError("At least 2 camera slots are required (R3)")
+        if len(self.slots) <= settings.camera_slot_range[0]:
+            raise RuntimeError(f"At least {settings.camera_slot_range[0]} camera slots are required (R3)")
         if slot_id < 0 or slot_id >= len(self.slots):
             raise IndexError(f"Invalid camera slot: {slot_id}")
         self.stop_slot_preview(slot_id)
@@ -199,7 +198,7 @@ class MultiCamSession:
         logger.info("D1 devices: %d found", len(self.devices))
         return list(self.devices)
 
-    def find_device(self, cam_id: str) -> Optional[ConnectedCamera]:
+    def find_device(self, cam_id: str) -> ConnectedCamera | None:
         for d in self.devices:
             if d.cam_id == cam_id:
                 return d
@@ -279,7 +278,7 @@ class MultiCamSession:
         want_high = (
             slot.camera.device_tag == "elgato"
             and slot.mode is not None
-            and int(slot.mode.fps) >= 90
+            and int(slot.mode.fps) >= settings.high_rate_fps
         )
         if want_high:
             for other in self.slots:
@@ -344,7 +343,7 @@ class MultiCamSession:
             s.camera is not None
             and s.camera.device_tag == "elgato"
             and s.mode is not None
-            and int(s.mode.fps) >= 90
+            and int(s.mode.fps) >= settings.high_rate_fps
             for s in self.slots
         )
 
@@ -381,7 +380,7 @@ class MultiCamSession:
                     time.sleep(0.35)
             except PreviewOpenCancelled:
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(f"slot{slot.slot_id}: {exc}")
                 slot.status = f"error: {exc}"
                 logger.exception("start_slot_preview failed for slot %d", slot.slot_id)
@@ -394,8 +393,8 @@ class MultiCamSession:
 
     def start_recording_armed(
         self,
-        stamp: Optional[str] = None,
-        bag_intent: Optional[dict[int, bool]] = None,
+        stamp: str | None = None,
+        bag_intent: dict[int, bool] | None = None,
     ) -> list[Path]:
         """
         R6 — one Record action: start encode on every armed slot.
@@ -474,7 +473,7 @@ class MultiCamSession:
             stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
             paths: list[Path] = []
             started: list[CameraSlot] = []
-            jobs: list[tuple[CameraSlot, Path, Path, Optional[Path]]] = []
+            jobs: list[tuple[CameraSlot, Path, Path, Path | None]] = []
             try:
                 for s in armed:
                     if s.pipeline is not None:
@@ -484,7 +483,7 @@ class MultiCamSession:
                             )
                         except Exception:  # noqa: BLE001
                             live = 0.0
-                        if live >= 5:
+                        if live >= settings.min_live_fps:
                             s.pipeline._preview_fps_hint = live
                     mp4 = self.out_dir / f"{s.prefix}_{stamp}.mp4"
                     csv = meta_dir / f"{s.prefix}_{stamp}_sysmon.csv"
@@ -655,7 +654,7 @@ class MultiCamSession:
                     f"stopped [{drops}] written={report.get('frames_written')}"
                 )
                 return slot.prefix, report
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.exception("stop_recording failed for %s", slot.prefix)
                 slot.status = f"stop error: {exc}"
                 return slot.prefix, {"error": str(exc)}

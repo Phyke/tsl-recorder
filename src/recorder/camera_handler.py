@@ -25,10 +25,11 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
+from recorder.config import settings
 from recorder.frame_source import FrameSource
 
 logger = logging.getLogger("poc1.camera_handler")
@@ -59,7 +60,7 @@ class DropCountingQueue:
     """
 
     def __init__(self, maxsize: int, drop_oldest: bool, name: str):
-        self._q: "queue.Queue[Any]" = queue.Queue(maxsize=maxsize)
+        self._q: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
         self.maxsize = maxsize
         self._drop_oldest = drop_oldest
         self._name = name
@@ -126,7 +127,7 @@ class DropCountingQueue:
             return False
 
 
-    def get(self, timeout: Optional[float] = None) -> Optional[Any]:
+    def get(self, timeout: float | None = None) -> Any | None:
         try:
             if timeout == 0:
                 return self._q.get_nowait()
@@ -180,7 +181,7 @@ class CameraHandler:
         self.processor_queue = DropCountingQueue(
             self.processor_queue_size, drop_oldest=False, name="processor_in"
         )
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._running = threading.Event()
         self._recording = threading.Event()
         self._paused = threading.Event()  # clear = reading; set = pause reads
@@ -218,7 +219,7 @@ class CameraHandler:
         if callable(flush):
             try:
                 flush()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.debug("flush_to_live failed", exc_info=True)
         try:
             self.viewer_queue.clear()
@@ -278,11 +279,11 @@ class CameraHandler:
             self._thread = None
         try:
             self.source.stop()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("recover_capture: source.stop failed")
         try:
             self.source.start()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("recover_capture: source.start failed")
             return
         self._delivery_ts = []
@@ -327,7 +328,7 @@ class CameraHandler:
         if len(self._delivery_ts) > 180:
             self._delivery_ts = self._delivery_ts[-180:]
         live = self.live_delivery_fps()
-        if live < 5:
+        if live < settings.min_live_fps:
             return
         try:
             self.source.actual_fps = live

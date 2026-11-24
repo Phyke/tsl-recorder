@@ -3,8 +3,8 @@ R8 — post-save review prompt that auto-dismisses after 5 seconds.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Callable, Optional, Sequence
 
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QVBoxLayout, QWidget
@@ -20,7 +20,7 @@ def show_review_prompt(
     timeout_ms: int = 5000,
     title: str = "Recording saved",
     review_label: str = "Review",
-) -> Optional[QDialog]:
+) -> QDialog | None:
     """
     Ask whether to review footage. Auto-destroys after timeout_ms.
 

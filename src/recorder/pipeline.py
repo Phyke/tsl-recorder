@@ -11,15 +11,15 @@ from __future__ import annotations
 
 import json
 import logging
-import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
 
 import cv2
 
 from recorder.bag_recorder import start_bag_recording, stop_bag_recording
 from recorder.camera_handler import CameraHandler, FrameEnvelope
+from recorder.config import settings
 from recorder.frame_source import FrameSource
 from recorder.monitor import SystemMonitor
 from recorder.processor import Processor
@@ -45,7 +45,7 @@ class CvCaptureSource:
         self.height = height
         self.target_fps = fps
         self._backend = cv2.CAP_DSHOW if backend is None else backend
-        self._cap: Optional[cv2.VideoCapture] = None
+        self._cap: cv2.VideoCapture | None = None
         self.actual_fps: float = 0.0
         self.actual_width: int = width
         self.actual_height: int = height
@@ -96,8 +96,8 @@ class CvCaptureSource:
 class Pipeline:
     source: FrameSource
     on_preview_frame: Callable[[FrameEnvelope], None]
-    output_path: Optional[Path] = None
-    monitor_csv: Optional[Path] = None
+    output_path: Path | None = None
+    monitor_csv: Path | None = None
     # The station name ("" when not set); the session sets it before each Record, and the report writes it.
     station: str = ""
 
@@ -107,17 +107,17 @@ class Pipeline:
         self.viewer = StreamViewer(
             in_queue=self.camera_handler.viewer_queue, on_frame=self.on_preview_frame
         )
-        self.recorder: Optional[Recorder] = None
-        self.monitor: Optional[SystemMonitor] = None
+        self.recorder: Recorder | None = None
+        self.monitor: SystemMonitor | None = None
         self._preview_started = False
         self._last_report: dict = {}
-        self._bag_path: Optional[Path] = None
-        self._bag_written: Optional[Path] = None
+        self._bag_path: Path | None = None
+        self._bag_written: Path | None = None
         self._uvc_bag = None
         self._record_held = False
-        self._pending_uvc_bag: Optional[Path] = None
+        self._pending_uvc_bag: Path | None = None
         self._record_allow_remux = True
-        self._record_output_path: Optional[Path] = None
+        self._record_output_path: Path | None = None
 
     def start_preview(self) -> None:
         if self._preview_started:
@@ -153,7 +153,7 @@ class Pipeline:
         try:
             resume()
             logger.info("RealSense .db3 resumed with MP4 arm")
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "Could not resume paused RealSense bag; file may already be writing"
             )
@@ -166,7 +166,7 @@ class Pipeline:
         self,
         output_path: Path,
         monitor_csv: Path,
-        bag_path: Optional[Path] = None,
+        bag_path: Path | None = None,
         hold: bool = False,
     ) -> None:
         if not self._preview_started:
@@ -186,7 +186,7 @@ class Pipeline:
         # Defer Elgato ROS2 bag until Record frames are flowing. Starting the
         # bag writer before arm raced DirectShow and left frames_read==0 while
         # the HUD still showed a stale ~59 from preview.
-        pending_uvc_bag: Optional[Path] = None
+        pending_uvc_bag: Path | None = None
         if bag_path is not None:
             if tag == "elgato":
                 pending_uvc_bag = Path(bag_path)
@@ -258,7 +258,7 @@ class Pipeline:
         if callable(flush):
             try:
                 flush()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("flush_to_live failed")
 
     def release_recording(self) -> None:
@@ -381,15 +381,15 @@ class Pipeline:
         requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
         try:
             live = float(self.camera_handler.live_delivery_fps() or 0)
-            if live >= 5:
+            if live >= settings.min_live_fps:
                 rate = max(rate, live)
         except Exception:  # noqa: BLE001
             pass
         hint = float(getattr(self, "_preview_fps_hint", 0) or 0)
         # Preview paint is capped (~15Hz) — only use it if we have no better signal.
-        if rate < 5 and hint >= 5:
+        if rate < settings.min_live_fps and hint >= settings.min_live_fps:
             rate = hint
-        if rate < 5:
+        if rate < settings.min_live_fps:
             return
         self.source.actual_fps = rate
         stamped = honest_container_fps(rate, requested)
@@ -425,7 +425,7 @@ class Pipeline:
             )
         try:
             self.camera_handler.disable_recording()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("disable_recording failed")
         # Pause the .db3 on the same beat the MP4 stops accepting frames.
         # Doing this after pause_reads lets the SDK keep writing while Python
@@ -435,7 +435,7 @@ class Pipeline:
             if callable(pause_bag):
                 try:
                     pause_bag()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("pause_bag at stop failed")
         if self._uvc_bag is None:
             try:
@@ -444,7 +444,7 @@ class Pipeline:
                     self._bag_written = stop_bag_recording(self.source)
                 finally:
                     self.camera_handler.resume_reads()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("stop_bag_recording failed")
                 self._bag_written = None
                 try:
@@ -454,7 +454,7 @@ class Pipeline:
         if self.processor:
             try:
                 self.processor.stop()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("processor.stop failed")
         bag_dropped = 0
         bag_frames = 0
@@ -465,19 +465,19 @@ class Pipeline:
                 self._bag_written = self._uvc_bag.stop() or self._bag_path
                 bag_dropped = int(getattr(self._uvc_bag, "dropped", bag_dropped) or 0)
                 bag_frames = int(getattr(self._uvc_bag, "frames_written", bag_frames) or 0)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("UVC ROS2 bag stop failed")
             self._uvc_bag = None
             self.processor.sidecar_bag = None
         if self.recorder:
             try:
                 self.recorder.stop()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("recorder.stop failed")
         if self.monitor:
             try:
                 self.monitor.stop()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("monitor.stop failed")
         report = self.report()
         report["bag_dropped"] = bag_dropped
@@ -502,7 +502,7 @@ class Pipeline:
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
                 report["report_path"] = str(report_path)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("could not write report json")
         logger.info("Recording stopped: %s", report)
         is_uvc_bag = str(getattr(self.source, "device_tag", "") or "") == "elgato"
@@ -533,7 +533,7 @@ class Pipeline:
             try:
                 if self.convert_container_fps():
                     report = self._last_report or self.report()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("auto FPS convert failed")
         return report
 
@@ -572,7 +572,7 @@ class Pipeline:
         no_capture = read == 0
         requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
         measured = float(recorder_summary.get("measured_fps") or 0)
-        if measured < 5:
+        if measured < settings.min_live_fps:
             measured = float(getattr(self.source, "actual_fps", 0) or 0)
         container = recorder_summary.get("container_fps", self.source.target_fps)
         tag = str(getattr(self.source, "device_tag", "") or "")
@@ -581,7 +581,7 @@ class Pipeline:
             and no_drops
             and measured >= 110.0
         )
-        hdmi_not_120 = bool(tag == "elgato" and requested >= 90 and measured < requested * 0.85)
+        hdmi_not_120 = bool(tag == "elgato" and requested >= settings.high_rate_fps and measured < requested * 0.85)
         return {
             "station": self.station,
             "frames_read_by_camera": read,

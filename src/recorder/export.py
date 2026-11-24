@@ -11,19 +11,21 @@ import logging
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import cv2
 import numpy as np
 
 from recorder.codec import _probe_fourcc
+from recorder.config import settings
 from recorder.device_enum import quiet_opencv
 
 logger = logging.getLogger("poc1.d2.export")
 
-ProgressCb = Optional[Callable[[str], None]]
+ProgressCb = Callable[[str], None] | None
 
 _IMAGE_MSG_TYPES = {
     "sensor_msgs/msg/Image",
@@ -36,7 +38,7 @@ _IMAGE_MSG_TYPES = {
 @dataclass
 class ExportResult:
     ok: bool
-    output_path: Optional[Path]
+    output_path: Path | None
     codec_label: str
     frames: int = 0
     message: str = ""
@@ -95,7 +97,7 @@ def list_media_files(folder: Path) -> list[Path]:
 
 def export_to_mp4(
     source: Path,
-    output: Optional[Path] = None,
+    output: Path | None = None,
     *,
     codec: str = "h264",
     on_progress: ProgressCb = None,
@@ -146,7 +148,7 @@ def _avoid_overwriting_record_mp4(source: Path, output: Path, codec: str) -> Pat
 
 def _open_writer(
     path: Path, fourcc_str: str, fps: float, width: int, height: int
-) -> tuple[Optional[cv2.VideoWriter], str]:
+) -> tuple[cv2.VideoWriter | None, str]:
     with quiet_opencv():
         writer = cv2.VideoWriter(
             str(path),
@@ -170,7 +172,7 @@ def _open_writer(
     return None, fourcc_str
 
 
-def _sibling_record_mp4(source: Path) -> Optional[Path]:
+def _sibling_record_mp4(source: Path) -> Path | None:
     """MP4 written beside a RealSense .bag/.db3 or Elgato ROS2 folder on the same take."""
     source = Path(source)
     candidates: list[Path] = [source.with_suffix(".mp4")]
@@ -191,7 +193,7 @@ def _sibling_record_mp4(source: Path) -> Optional[Path]:
         if key in seen:
             continue
         seen.add(key)
-        if candidate.is_file() and candidate.stat().st_size > 32:
+        if candidate.is_file() and candidate.stat().st_size > settings.min_file_bytes:
             return candidate
     return None
 
@@ -204,7 +206,7 @@ def _start_realsense_playback(rs: Any, source: Path):
     only, and enabling a missing stream makes resolve() fail.
     """
     source_s = str(Path(source).resolve())
-    last_exc: Optional[BaseException] = None
+    last_exc: BaseException | None = None
 
     strategies: list[tuple[str, Callable[[], Any]]] = []
 
@@ -322,13 +324,13 @@ def _export_realsense_bag(
         logger.warning("as_playback failed (continuing): %s", exc)
 
     colorizer = rs.colorizer()
-    writer: Optional[cv2.VideoWriter] = None
+    writer: cv2.VideoWriter | None = None
     used_fourcc = fourcc
     frames_written = 0
     width = height = 0
     fps = 30.0
 
-    def to_bgr(color_frame) -> Optional[np.ndarray]:
+    def to_bgr(color_frame) -> np.ndarray | None:
         arr = np.asanyarray(color_frame.get_data())
         fmt = None
         try:
@@ -516,7 +518,7 @@ def _export_via_ffmpeg(
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
     except Exception as exc:  # noqa: BLE001
         return ExportResult(False, None, label, message=str(exc))
-    if proc.returncode != 0 or not output.is_file() or output.stat().st_size < 32:
+    if proc.returncode != 0 or not output.is_file() or output.stat().st_size < settings.min_file_bytes:
         err = (proc.stderr or proc.stdout or "ffmpeg failed").strip()
         return ExportResult(False, None, label, message=err[:500])
     return ExportResult(
@@ -527,7 +529,7 @@ def _export_via_ffmpeg(
     )
 
 
-def _find_ffmpeg() -> Optional[str]:
+def _find_ffmpeg() -> str | None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         return ffmpeg
@@ -562,7 +564,7 @@ def _looks_like_ros2_db3(source: Path) -> bool:
         return False
 
 
-def _resolve_rosbag_dir(source: Path) -> tuple[Path, Optional[tempfile.TemporaryDirectory]]:
+def _resolve_rosbag_dir(source: Path) -> tuple[Path, tempfile.TemporaryDirectory | None]:
     """
     Return a directory path AnyReader can open.
 
@@ -704,7 +706,7 @@ def _export_rosbag2_to_mp4(
             chosen = image_conns[0]
             progress(f"Exporting topic {chosen.topic} ({chosen.msgtype})")
 
-            writer: Optional[cv2.VideoWriter] = None
+            writer: cv2.VideoWriter | None = None
             used_fourcc = fourcc
             frames_written = 0
             width = height = 0
@@ -788,7 +790,7 @@ def _export_rosbag2_to_mp4(
                     f"Wrote {frames_written} frames from {chosen.topic} -> {output.name}"
                 ),
             )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("rosbag export failed")
         output.unlink(missing_ok=True)
         return ExportResult(
@@ -829,7 +831,7 @@ def _rewrite_mp4_fps(
     finally:
         cap.release()
         writer.release()
-    return dest.is_file() and dest.stat().st_size > 32
+    return dest.is_file() and dest.stat().st_size > settings.min_file_bytes
 
 
 def _export_bd3_or_db3(

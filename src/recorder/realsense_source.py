@@ -11,7 +11,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import numpy as np
 
@@ -57,7 +57,7 @@ class SimulatedRealSenseSource:
     width: int = 1280
     height: int = 720
     target_fps: int = 30
-    serial: Optional[str] = "SIMULATED"
+    serial: str | None = "SIMULATED"
     mode: str = field(default="simulated", init=False)
     allow_fps_remux: bool = False
     _inner: FakeFrameSource = field(init=False, repr=False)
@@ -78,7 +78,7 @@ class SimulatedRealSenseSource:
     def stop(self) -> None:
         self._inner.stop()
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self) -> np.ndarray | None:
         frame = self._inner.read()
         if frame is not None:
             embed_status_banner(frame, "SIMULATED — no RealSense connected")
@@ -95,13 +95,13 @@ class RealSenseFrameSource:
     width: int = 1920
     height: int = 1080
     target_fps: int = 30
-    serial: Optional[str] = None
+    serial: str | None = None
     enable_depth: bool = False
-    bag_path: Optional[Any] = None
+    bag_path: Any | None = None
     mode: str = field(default="hardware", init=False)
 
     _pipeline: Any = field(default=None, init=False, repr=False)
-    _bag_path: Optional[Any] = field(default=None, init=False, repr=False)
+    _bag_path: Any | None = field(default=None, init=False, repr=False)
 
     def start(self) -> None:
         if not realsense_available():
@@ -122,8 +122,8 @@ class RealSenseFrameSource:
             rs.stream.color, self.width, self.height, rs.format.bgr8, self.target_fps
         )
         if want_depth:
-            dw = self.width if self.width <= 1280 else 1280
-            dh = self.height if self.height <= 720 else 720
+            dw = min(self.width, 1280)
+            dh = min(self.height, 720)
             config.enable_stream(
                 rs.stream.depth, dw, dh, rs.format.z16, self.target_fps
             )
@@ -210,7 +210,7 @@ class RealSenseFrameSource:
             if not frames:
                 break
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self) -> np.ndarray | None:
         if self._pipeline is None:
             return None
         try:
@@ -227,9 +227,9 @@ def create_realsense_source(
     width: int = 1280,
     height: int = 720,
     fps: int = 30,
-    serial: Optional[str] = None,
+    serial: str | None = None,
     allow_simulate: bool = True,
-) -> Union[RealSenseFrameSource, SimulatedRealSenseSource]:
+) -> RealSenseFrameSource | SimulatedRealSenseSource:
     """Prefer real hardware; optionally fall back to simulation for POC-1."""
     if not realsense_available():
         if allow_simulate:

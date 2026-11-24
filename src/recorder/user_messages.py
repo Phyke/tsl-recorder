@@ -1,8 +1,6 @@
 """Operator-facing error text for the unified app (plain language, not dev jargon)."""
 from __future__ import annotations
 
-from typing import Optional
-
 
 def elgato_preview_failed_message(raw_error: str) -> str:
     """Turn OpenCV/ffmpeg exceptions into actionable Elgato preview steps."""
@@ -62,7 +60,7 @@ def preview_failed_message(
 def capture_not_120_status(
     requested: int,
     measured: float,
-    stamped: float | int,
+    stamped: float,
 ) -> str:
     """Status-bar text when Elgato asked for ≥90 but delivery was lower."""
     return (

@@ -14,6 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from recorder.config import settings
 from recorder.device_enum import quiet_opencv
 
 logger = logging.getLogger("poc1.codec")
@@ -56,7 +57,7 @@ def _probe_fourcc(fourcc_str: str, width: int = 64, height: int = 64, fps: int =
             frame = np.zeros((height, width, 3), dtype=np.uint8)
             writer.write(frame)
             writer.release()
-            if not tmp.exists() or tmp.stat().st_size < 32:
+            if not tmp.exists() or tmp.stat().st_size < settings.min_file_bytes:
                 return False
             cap = cv2.VideoCapture(str(tmp))
             ok = cap.isOpened()

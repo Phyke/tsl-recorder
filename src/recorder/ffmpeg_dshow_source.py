@@ -15,7 +15,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -55,7 +54,7 @@ def _pin_args_for_mode(mode: InputMode) -> list[str]:
     return []
 
 
-def find_ffmpeg() -> Optional[str]:
+def find_ffmpeg() -> str | None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         return ffmpeg
@@ -72,7 +71,7 @@ def find_ffmpeg() -> Optional[str]:
     return None
 
 
-def dshow_input_names(open_path: Optional[str]) -> list[str]:
+def dshow_input_names(open_path: str | None) -> list[str]:
     """Plain DirectShow device names for ffmpeg ``-i video=…``."""
     from recorder.win_names import elgato_open_name_paths
 
@@ -100,8 +99,8 @@ def _pixel_formats_to_try(requested_fmt: str) -> list[InputMode]:
 def _lock_threshold(requested_fps: int) -> float:
     """Minimum measured fps to treat high-rate (≥90 ask) as locked."""
     req = int(requested_fps) if int(requested_fps) > 0 else 30
-    if req >= 90:
-        return 90.0
+    if req >= settings.high_rate_fps:
+        return float(settings.high_rate_fps)
     return req * 0.85
 
 
@@ -119,7 +118,7 @@ class FfmpegDshowCaptureSource:
         device_names: list[str],
         pixel_format: str = "mjpg",
         device_tag: str = "elgato",
-        pipe_pix_fmt: Optional[str] = None,
+        pipe_pix_fmt: str | None = None,
     ) -> None:
         self.width = int(width)
         self.height = int(height)
@@ -131,14 +130,14 @@ class FfmpegDshowCaptureSource:
         self.actual_width = self.width
         self.actual_height = self.height
         self._device_names = [n for n in device_names if n]
-        self._ffmpeg: Optional[str] = find_ffmpeg()
-        self._proc: Optional[subprocess.Popen] = None
-        self._thread: Optional[threading.Thread] = None
+        self._ffmpeg: str | None = find_ffmpeg()
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
         self._running = False
         self.pipe_pix_fmt = pipe_pix_fmt or pipe_pix_fmt_for_fps(self.target_fps)
         self._frame_bytes = frame_bytes(self.width, self.height, self.pipe_pix_fmt)
-        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=8)
-        self._pending: Optional[np.ndarray] = None
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=8)
+        self._pending: np.ndarray | None = None
         self._active_device = ""
         self._active_input_mode = ""
 
@@ -268,8 +267,7 @@ class FfmpegDshowCaptureSource:
         last_rate = 0.0
         for cmd in self._cmd_variants(device, input_mode):
             rate = self._try_open_cmd(cmd, input_mode, measure_s)
-            if rate > last_rate:
-                last_rate = rate
+            last_rate = max(last_rate, rate)
             if rate >= _lock_threshold(self.target_fps):
                 return rate
             self.stop()
@@ -371,7 +369,7 @@ class FfmpegDshowCaptureSource:
     def _seek_live_edge(self) -> None:
         """Discard buffered frames from lock/measure; keep only the newest."""
         self._pending = None
-        latest: Optional[np.ndarray] = None
+        latest: np.ndarray | None = None
         while True:
             try:
                 frame = self._queue.get_nowait()
@@ -382,7 +380,7 @@ class FfmpegDshowCaptureSource:
             latest = frame
         self._pending = latest
 
-    def _dequeue_newest(self, *, block: bool, timeout: float = 2.0) -> Optional[np.ndarray]:
+    def _dequeue_newest(self, *, block: bool, timeout: float = 2.0) -> np.ndarray | None:
         """Return the freshest queued frame (drop older buffered copies)."""
         if block:
             try:
@@ -406,7 +404,7 @@ class FfmpegDshowCaptureSource:
             frame = nxt
         return frame
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self) -> np.ndarray | None:
         if not self._running:
             return None
         if self._pending is not None:

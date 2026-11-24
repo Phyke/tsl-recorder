@@ -22,6 +22,12 @@ class Settings(BaseModel):
     font_size_range: ClassVar[tuple[int, int]] = (8, 24)
     # DirectShow input buffer (ffmpeg -rtbufsize) — 150M caused ~1–3s preview lag vs RealSense.
     dshow_rtbufsize: ClassVar[str] = "20M"
+    # A mode at this fps or more counts as high rate (Elgato 1080p120).
+    high_rate_fps: ClassVar[int] = 90
+    # A measured frame rate below this is not a real measurement (the camera is not live yet).
+    min_live_fps: ClassVar[int] = 5
+    # A file smaller than this counts as empty (the write failed).
+    min_file_bytes: ClassVar[int] = 32
     # Preview copies stay small so the UI stays responsive at 1080p/120 capture.
     preview_max_width: ClassVar[int] = 960
     preview_hz: ClassVar[float] = 15.0
@@ -47,7 +53,7 @@ class Settings(BaseModel):
     font_size: int = Field(16, ge=font_size_range[0], le=font_size_range[1])
     save_folder: str = ""
     camera_slots: int = Field(2, ge=camera_slot_range[0], le=camera_slot_range[1])
-    station: Literal[("",) + stations] = ""
+    station: Literal[("", *stations)] = ""
 
 
 settings = Settings()

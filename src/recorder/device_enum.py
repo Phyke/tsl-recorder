@@ -8,9 +8,9 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Optional
 
 import cv2
 
@@ -56,14 +56,14 @@ class CameraInfo:
     negotiated_fps: float = 0.0
 
 
-def _probe_index(index: int, backend: int, backend_name: str) -> Optional[CameraInfo]:
+def _probe_index(index: int, backend: int, backend_name: str) -> CameraInfo | None:
     cap = cv2.VideoCapture(index, backend)
     if not cap.isOpened():
         cap.release()
         return None
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    seqs: list[Optional[int]] = []
+    seqs: list[int | None] = []
     for _ in range(3):
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -132,7 +132,7 @@ def list_capture_devices(max_index: int = 10) -> list[CameraInfo]:
 
 
 def find_capture_card_index(
-    preferred: Optional[int] = None,
+    preferred: int | None = None,
     width: int = 1920,
     height: int = 1080,
     fps: int = 120,
@@ -165,7 +165,7 @@ def find_capture_card_index(
     deadline = time.time() + timeout_s
     last_err = "no devices"
     while time.time() < deadline:
-        best: Optional[tuple[int, int, int]] = None  # score, index, backend
+        best: tuple[int, int, int] | None = None  # score, index, backend
         with quiet_opencv():
             for info in list_capture_devices(max_index=10):
                 if info.barcode_increasing:
@@ -220,7 +220,7 @@ def find_capture_card_index(
 
 
 def find_virtualcam_index(
-    preferred: Optional[int] = None,
+    preferred: int | None = None,
     timeout_s: float = 8.0,
 ) -> tuple[int, int]:
     """

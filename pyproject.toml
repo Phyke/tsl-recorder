@@ -48,3 +48,10 @@ constraint-dependencies = [
     "numpy==2.4.6; python_full_version == '3.11.*'",
     "numpy==2.5.1; python_full_version >= '3.12'",
 ]
+
+[tool.ruff]
+line-length = 144
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["COM812", "CPY001", "D"]

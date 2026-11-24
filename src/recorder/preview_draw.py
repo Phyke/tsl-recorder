@@ -106,10 +106,10 @@ def hud_lines_for_source(slot, src) -> list[str]:
             lines.append("pipe: NV12 (BGR deferred)")
     if preview_fps > 1:
         lines.append(f"UI paint ~{preview_fps:.0f} fps (not file FPS)")
-    if mode_fps >= 90 and camera_fps < mode_fps * 0.85 and tag == "elgato":
+    if mode_fps >= settings.high_rate_fps and camera_fps < mode_fps * 0.85 and tag == "elgato":
         from recorder.user_messages import capture_not_120_hud_hint
 
         lines.append(capture_not_120_hud_hint(camera_fps, mode_fps, stamped))
-    elif kind == "realsense" and mode_fps >= 90:
+    elif kind == "realsense" and mode_fps >= settings.high_rate_fps:
         lines.append("D400 color is not 120fps")
     return lines

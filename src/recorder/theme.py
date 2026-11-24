@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import itertools
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import numpy as np
 from PySide6.QtCore import Qt
@@ -130,7 +130,7 @@ def _apply_text_size(widget: QWidget) -> None:
 
 # One frame with a scoped stylesheet, so the background does not leak into child widgets.
 def frame(
-    parent: Optional[QWidget],
+    parent: QWidget | None,
     bg: str,
     *,
     border: bool = False,
@@ -156,11 +156,11 @@ def frame(
 
 
 def label(
-    parent: Optional[QWidget],
+    parent: QWidget | None,
     text: str = "",
     *,
     fg: str = INK,
-    bg: Optional[str] = None,
+    bg: str | None = None,
     font_spec: tuple = ("Segoe UI", 9),
     padx: int = 0,
     pady: int = 0,
@@ -178,7 +178,7 @@ def label(
     return widget
 
 
-def set_label_colors(widget: QLabel, fg: str, bg: Optional[str] = None, *, padx: int = 0, pady: int = 0) -> None:
+def set_label_colors(widget: QLabel, fg: str, bg: str | None = None, *, padx: int = 0, pady: int = 0) -> None:
     background = f"background: {bg};" if bg else "background: transparent;"
     widget.setStyleSheet(f"QLabel {{ color: {fg}; {background} padding: {pady}px {padx}px; border: 0; }}")
 
@@ -197,7 +197,7 @@ def style_check_box(box: QCheckBox) -> None:
 
 
 def button(
-    master: Optional[QWidget],
+    master: QWidget | None,
     text: str,
     command: Callable[[], None],
     *,
@@ -224,7 +224,7 @@ def button(
 # Its size comes from 20 characters (the ttk Combobox default width), not from the longest item.
 # The combo box and its list use the base text size, so they follow the Interface font size like the text.
 class NoWheelComboBox(QComboBox):
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFont(font(("Segoe UI", settings.base_font_size)))
         self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -265,7 +265,7 @@ def set_combo_values(combo: QComboBox, values: list[str]) -> None:
 
 
 # An image label that does not grow with its picture (a Tk label in a fixed cell).
-def image_label(parent: Optional[QWidget], text: str, *, bg: str = "#0b1220", fg: str = "#94a3b8", size: int = 10) -> QLabel:
+def image_label(parent: QWidget | None, text: str, *, bg: str = "#0b1220", fg: str = "#94a3b8", size: int = 10) -> QLabel:
     widget = label(parent, text, fg=fg, bg=bg, font_spec=("Segoe UI", size), align=Qt.AlignmentFlag.AlignCenter)
     widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
     widget.setMinimumSize(1, 1)

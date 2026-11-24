@@ -10,11 +10,15 @@ from PySide6.QtWidgets import QCheckBox, QFrame, QHBoxLayout, QLineEdit, QMessag
 
 logger = logging.getLogger("poc1.app.cards")
 
+from recorder.config import settings  # noqa: E402
+from recorder.devices import StreamMode, pick_auto_camera_for_slot  # noqa: E402
+from recorder.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud  # noqa: E402
+from recorder.session import CameraSlot  # noqa: E402
 from recorder.theme import (  # noqa: E402
     ACCENT,
     ACCENT_SOFT,
-    BORDER,
     BLUE,
+    BORDER,
     INK,
     MUTED,
     PANEL,
@@ -34,9 +38,6 @@ from recorder.theme import (  # noqa: E402
     style_check_box,
     text_size,
 )
-from recorder.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud  # noqa: E402
-from recorder.devices import StreamMode, pick_auto_camera_for_slot  # noqa: E402
-from recorder.session import CameraSlot  # noqa: E402
 
 if TYPE_CHECKING:
     from recorder.gui import UnifiedApp
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
 class CameraCard(QFrame):
     """One camera lane: device, config, arm, optional RealSense .bag."""
 
-    def __init__(self, master: QWidget, app: "UnifiedApp", slot: CameraSlot):
+    def __init__(self, master: QWidget, app: UnifiedApp, slot: CameraSlot):
         super().__init__(master)
         self.setObjectName(f"cameraCard{slot.slot_id}")
         self.setStyleSheet(f"QFrame#cameraCard{slot.slot_id} {{ background: {PANEL}; border: 1px solid {BORDER}; }}")
@@ -77,7 +78,7 @@ class CameraCard(QFrame):
             pady=4,
         )
         head_row.addWidget(self.remove_btn)
-        if len(self.session.slots) <= 2:
+        if len(self.session.slots) <= settings.camera_slot_range[0]:
             self.remove_btn.setEnabled(False)
 
         form, grid = frame(self, PANEL, padx=14, pady=10, kind="grid")
@@ -161,7 +162,7 @@ class CameraCard(QFrame):
     def load_devices(self, auto_assign: bool = False) -> None:
         labels = [d.label() for d in self.session.devices]
         self._cam_by_label = {d.label(): d.cam_id for d in self.session.devices}
-        set_combo_values(self.device_combo, ["Select a camera…"] + labels)
+        set_combo_values(self.device_combo, ["Select a camera…", *labels])
         slot = self.session.slots[self.slot_id]
 
         if slot.camera:
@@ -345,7 +346,7 @@ class CameraCard(QFrame):
         self.prefix_entry.setEnabled(not locked)
         self.arm_check.setEnabled(not locked)
         self._refresh_bag_enabled(locked=locked)
-        self.remove_btn.setEnabled(not (locked or len(self.session.slots) <= 2))
+        self.remove_btn.setEnabled(not (locked or len(self.session.slots) <= settings.camera_slot_range[0]))
 
     # Set the stylesheet only on a change, because the tick runs every 80 ms.
     def _set_badge(self, text: str, fg: str, bg: str) -> None:
@@ -366,7 +367,7 @@ class CameraCard(QFrame):
             stamp = int(getattr(src, "target_fps", 0) or 0)
             if measured > 1:
                 status = f"{status} | delivery ~{measured:.0f}fps"
-                if wanted >= 90 and measured < wanted * 0.85:
+                if wanted >= settings.high_rate_fps and measured < wanted * 0.85:
                     from recorder.user_messages import capture_not_120_status
 
                     status += (
@@ -400,12 +401,12 @@ class CameraCard(QFrame):
                     rgb = np.concatenate([left, right], axis=1)
             else:
                 rgb = bgr_to_rgb_fill(frame_bgr, tw, th)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("preview draw failed for slot %d", self.slot_id)
             return
         if src is not None:
             try:
                 rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("HUD overlay failed for slot %d", self.slot_id)
         show_rgb(self.preview, rgb)

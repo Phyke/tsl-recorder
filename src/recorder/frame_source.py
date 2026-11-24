@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Protocol
 
 import cv2
 import numpy as np
@@ -18,7 +18,7 @@ import numpy as np
 class FrameSource(Protocol):
     def start(self) -> None: ...
     def stop(self) -> None: ...
-    def read(self) -> Optional[np.ndarray]: ...
+    def read(self) -> np.ndarray | None: ...
     @property
     def width(self) -> int: ...
     @property
@@ -48,7 +48,7 @@ def embed_seq_barcode(frame: np.ndarray, seq: int) -> None:
         frame[0:_BAR_H, x0:x0 + _BAR_BIT_W, :] = 255 if on else 0
 
 
-def read_seq_barcode(frame: np.ndarray) -> Optional[int]:
+def read_seq_barcode(frame: np.ndarray) -> int | None:
     need_w = _BAR_BITS * _BAR_BIT_W
     if frame.shape[1] < need_w or frame.shape[0] < _BAR_H:
         return None
@@ -102,7 +102,7 @@ class FakeFrameSource:
         self._running = False
         self._base_frame = self._make_base_frame()
 
-    def _make_base_frame(self) -> Optional[np.ndarray]:
+    def _make_base_frame(self) -> np.ndarray | None:
         if self.pattern == "noise":
             return None
         frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
@@ -131,7 +131,7 @@ class FakeFrameSource:
     def stop(self) -> None:
         self._running = False
 
-    def read(self) -> Optional[np.ndarray]:
+    def read(self) -> np.ndarray | None:
         if not self._running:
             return None
 

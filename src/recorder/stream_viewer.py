@@ -8,8 +8,8 @@ frames are silently dropped here (by design), not queued up.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 from recorder.camera_handler import DropCountingQueue, FrameEnvelope
 
@@ -20,7 +20,7 @@ class StreamViewer:
     on_frame: Callable[[FrameEnvelope], None]  # e.g. push into a GUI image widget
 
     def __post_init__(self) -> None:
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._running = threading.Event()
 
     def start(self) -> None:

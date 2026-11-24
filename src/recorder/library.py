@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import cv2
 from PySide6.QtCore import Qt, QTimer
@@ -22,6 +22,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from recorder.config import settings
+from recorder.device_enum import quiet_opencv
+from recorder.export import export_to_mp4, list_media_files
 from recorder.theme import (
     ACCENT,
     BG,
@@ -45,8 +48,6 @@ from recorder.theme import (
     show_text,
     text_size,
 )
-from recorder.export import export_to_mp4, list_media_files
-from recorder.device_enum import quiet_opencv
 from recorder.ui_bridge import call_in_ui
 
 if TYPE_CHECKING:
@@ -61,14 +62,14 @@ def _ask_yes_no(parent: QWidget, title: str, text: str) -> bool:
 
 
 class LibraryPage(QFrame):
-    def __init__(self, master: QWidget, app: "UnifiedApp"):
+    def __init__(self, master: QWidget, app: UnifiedApp):
         super().__init__(master)
         self.setObjectName("libraryPage")
         self.setStyleSheet(f"QFrame#libraryPage {{ background: {BG}; }}")
         self.app = app
         self.files: list[Path] = []
-        self.selected: Optional[Path] = None
-        self._cap: Optional[cv2.VideoCapture] = None
+        self.selected: Path | None = None
+        self._cap: cv2.VideoCapture | None = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._draw_next)
@@ -195,7 +196,7 @@ class LibraryPage(QFrame):
         export_grid.setVerticalSpacing(6)
         right_grid.setVerticalSpacing(8)
 
-    def _set_export_status(self, text: str, fg: Optional[str] = None) -> None:
+    def _set_export_status(self, text: str, fg: str | None = None) -> None:
         self.export_status.setText(text)
         if fg is not None:
             set_label_colors(self.export_status, fg)
@@ -241,7 +242,7 @@ class LibraryPage(QFrame):
             return f"{path.name}  [bag — Export / Play sibling MP4]"
         return path.name
 
-    def _current_index(self) -> Optional[int]:
+    def _current_index(self) -> int | None:
         rows = self.listbox.selectedIndexes()
         if not rows:
             return None
@@ -313,7 +314,7 @@ class LibraryPage(QFrame):
 
         if path.suffix.lower() in {".bag", ".bd3", ".db3"}:
             sibling = path.with_suffix(".mp4")
-            if sibling.is_file() and sibling.stat().st_size > 32:
+            if sibling.is_file() and sibling.stat().st_size > settings.min_file_bytes:
                 if _ask_yes_no(
                     self.window(),
                     "Playback",
@@ -336,7 +337,7 @@ class LibraryPage(QFrame):
         self._start_playback(path)
 
     @staticmethod
-    def _sibling_record_mp4_for_bag(path: Path) -> Optional[Path]:
+    def _sibling_record_mp4_for_bag(path: Path) -> Path | None:
         """Record MP4 beside a RealSense .db3 or Elgato *_color folder."""
         path = Path(path)
         candidates: list[Path] = []
@@ -351,7 +352,7 @@ class LibraryPage(QFrame):
             if stem.endswith("_color"):
                 candidates.append(path.parent / f"{stem[:-6]}.mp4")
         for candidate in candidates:
-            if candidate.is_file() and candidate.stat().st_size > 32:
+            if candidate.is_file() and candidate.stat().st_size > settings.min_file_bytes:
                 return candidate
         return None
 

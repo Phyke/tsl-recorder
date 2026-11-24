@@ -148,7 +148,7 @@ def _windows_capture_inventory() -> tuple[tuple[str, ...], bool]:
     PnP names are useful for labels but must NOT drive open-by-index paths.
     """
     if sys.platform != "win32":
-        return tuple(), False
+        return (), False
 
     names = _names_from_ffmpeg()
     if names:

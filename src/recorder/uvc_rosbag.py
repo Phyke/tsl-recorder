@@ -7,7 +7,6 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -26,10 +25,10 @@ class UvcRos2Bag:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         # ~4s at 120fps — overflow still increments ``dropped`` (honest report).
-        self._q: queue.Queue[Optional[tuple[bytes, int]]] = queue.Queue(maxsize=512)
-        self._thread: Optional[threading.Thread] = None
+        self._q: queue.Queue[tuple[bytes, int] | None] = queue.Queue(maxsize=512)
+        self._thread: threading.Thread | None = None
         self._ready = threading.Event()
-        self._error: Optional[str] = None
+        self._error: str | None = None
         self.frames_written = 0
         self.dropped = 0
 
@@ -57,7 +56,7 @@ class UvcRos2Bag:
         except queue.Full:
             self.dropped += 1
 
-    def stop(self) -> Optional[Path]:
+    def stop(self) -> Path | None:
         # Let the worker finish queued JPEGs before sentinel (no software loss
         # at Stop when encode can keep up).
         deadline = time.monotonic() + 25.0
@@ -124,7 +123,7 @@ class UvcRos2Bag:
                 cdr = typestore.serialize_cdr(msg, Compressed.__msgtype__)
                 writer.write(conn, ns, cdr)
                 self.frames_written += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._error = str(exc)
             logger.exception("ROS2 bag worker failed")
             self._ready.set()

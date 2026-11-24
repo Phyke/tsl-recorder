@@ -13,7 +13,6 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
 
 import cv2
 
@@ -65,13 +64,13 @@ class Recorder:
     correct_container_fps: bool = True
 
     def __post_init__(self) -> None:
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._running = threading.Event()
         self.frames_written = 0
-        self._last_seq: Optional[int] = None
+        self._last_seq: int | None = None
         self.gaps: list[tuple[int, int]] = []
-        self._first_capture_ts: Optional[float] = None
-        self._last_capture_ts: Optional[float] = None
+        self._first_capture_ts: float | None = None
+        self._last_capture_ts: float | None = None
         self.measured_fps: float = 0.0
         self.container_fps: float = float(self.fps)
         self.fps_corrected: bool = False
@@ -189,7 +188,7 @@ class Recorder:
 
     def _loop(self) -> None:
         while self._running.is_set() or self.out_queue.qsize() > 0:
-            item: Optional[Union[EncodedEnvelope, object]] = self.out_queue.get(timeout=0.2)
+            item: EncodedEnvelope | object | None = self.out_queue.get(timeout=0.2)
             if item is None:
                 if not self._running.is_set() and self.out_queue.qsize() == 0:
                     break

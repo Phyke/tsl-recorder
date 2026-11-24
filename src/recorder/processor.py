@@ -15,7 +15,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import cv2
 
@@ -44,13 +43,13 @@ class Processor:
         self.out_queue = DropCountingQueue(
             self.out_queue_size, drop_oldest=False, name="recorder_in"
         )
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._running = threading.Event()
         self._encode_lock = threading.Lock()
         self.frames_processed = 0
         self.bytes_encoded_est = 0
-        self._writer: Optional[cv2.VideoWriter] = None
-        self.output_path: Optional[Path] = None
+        self._writer: cv2.VideoWriter | None = None
+        self.output_path: Path | None = None
         self.width = 0
         self.height = 0
         self.fps = 30
@@ -66,7 +65,7 @@ class Processor:
         width: int,
         height: int,
         fps: int,
-        fourcc: Optional[str] = None,
+        fourcc: str | None = None,
     ) -> None:
         self.output_path = output_path
         self.width = width
@@ -149,7 +148,7 @@ class Processor:
             if self._writer is not None:
                 try:
                     self._writer.release()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("VideoWriter.release failed")
                 self._writer = None
         if self._slow_encodes:
@@ -177,7 +176,7 @@ class Processor:
             if sidecar is not None:
                 try:
                     sidecar.submit(frame, env.capture_ts)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     logger.exception("sidecar bag submit failed")
             budget = (1000.0 / max(self.fps, 1)) * 2
             if encode_ms > budget:
@@ -203,7 +202,7 @@ class Processor:
 
     def _loop(self) -> None:
         while self._running.is_set():
-            env: Optional[FrameEnvelope] = self.in_queue.get(timeout=0.1)
+            env: FrameEnvelope | None = self.in_queue.get(timeout=0.1)
             if env is None:
                 continue
             self._encode(env)
