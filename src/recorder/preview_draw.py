@@ -4,11 +4,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from recorder.config import settings
 from recorder.frame_layout import PIPE_NV12, ensure_bgr
-
-# Preview copies stay small so Tk stays responsive at 1080p/120 capture.
-PREVIEW_MAX_WIDTH = 960
-PREVIEW_HZ = 15.0
 
 
 def colorize_depth_preview(raw: np.ndarray) -> np.ndarray:
@@ -19,7 +16,7 @@ def colorize_depth_preview(raw: np.ndarray) -> np.ndarray:
     return cv2.applyColorMap(vis, cv2.COLORMAP_JET)
 
 
-def downscale_for_preview(frame: np.ndarray, max_width: int = PREVIEW_MAX_WIDTH) -> np.ndarray:
+def downscale_for_preview(frame: np.ndarray, max_width: int = settings.preview_max_width) -> np.ndarray:
     bgr = ensure_bgr(frame, 0, 0)
     h, w = bgr.shape[:2]
     if w <= max_width:

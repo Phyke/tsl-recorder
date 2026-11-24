@@ -16,7 +16,8 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from recorder.preview_draw import PREVIEW_HZ, colorize_depth_preview, downscale_for_preview
+from recorder.config import settings
+from recorder.preview_draw import colorize_depth_preview, downscale_for_preview
 from recorder.bag_recorder import clear_bag_on_source, with_sdk_record_suffix
 from recorder.camera_handler import FrameEnvelope
 from recorder.devices import (
@@ -33,12 +34,10 @@ from recorder.pipeline import Pipeline
 
 logger = logging.getLogger("poc1.d1.session")
 
-DEFAULT_PREFIXES = ("m", "r")
-
 
 def _default_prefix(index: int) -> str:
-    if index < len(DEFAULT_PREFIXES):
-        return DEFAULT_PREFIXES[index]
+    if index < len(settings.default_prefixes):
+        return settings.default_prefixes[index]
     return f"cam{index + 1}"
 
 
@@ -65,7 +64,7 @@ class CameraSlot:
     def on_preview(self, env: FrameEnvelope) -> None:
         # Preview is display-only. Do not copy full 1080p@120 onto the UI path.
         now = time.monotonic()
-        min_dt = 1.0 / PREVIEW_HZ
+        min_dt = 1.0 / settings.preview_hz
         if now - self._preview_draw_t < min_dt:
             return
         if env.frame is None:

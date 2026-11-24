@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
+from pydantic import ValidationError
 from PySide6.QtCore import QEvent, QLocale, QObject, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
@@ -41,6 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 from recorder.cards import CameraCard
+from recorder.config import load_settings, save_settings, settings
 from recorder.devices import (
     PreviewOpenCancelled,
     clear_preview_cancel,
@@ -60,8 +62,6 @@ from recorder.theme import (
     BG,
     BLUE,
     BORDER,
-    DEFAULT_FONT_SIZE,
-    FONT_SIZE_RANGE,
     GREEN,
     INK,
     MUTED,
@@ -89,30 +89,6 @@ from recorder.ui_bridge import call_in_ui
 
 configure_app_logging()
 logger = logging.getLogger("poc1.app")
-
-# The settings of this PC (font size, Save folder, camera slots at start, station), saved by the app.
-# Not in git: each station has its own file.
-SETTINGS_PATH = Path(__file__).resolve().parents[2] / "settings.json"
-DEFAULT_SAVE_FOLDER = Path("./recordings/deliverable1")
-STATIONS = ["Station A", "Station B"]
-CAMERA_SLOT_CHOICES = range(2, 9)
-DEFAULT_SETTINGS = {
-    "font_size": DEFAULT_FONT_SIZE,
-    "save_folder": "",
-    "camera_slots": 2,
-    "station": "",
-}
-
-
-# With no path (a test run), the settings are the defaults.
-def load_settings(path: Path | None) -> dict:
-    if path is None or not path.exists():
-        return dict(DEFAULT_SETTINGS)
-    return DEFAULT_SETTINGS | json.loads(path.read_text(encoding="utf-8"))
-
-
-def save_settings(path: Path, settings: dict) -> None:
-    path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
 
 def _ask_yes_no(parent: QWidget, title: str, text: str) -> bool:
@@ -161,14 +137,13 @@ class UnifiedApp:
 
     def __init__(self, root: AppWindow, n_slots: int = 2, out_dir: Path | None = None, settings_path: Path | None = None):
         self.root = root
-        # With no settings_path (a test run), the settings are the defaults and no change is saved.
+        # With no settings_path (a test run), no change is saved. main() loads the file into settings before this.
         self.settings_path = settings_path
-        self.settings = load_settings(settings_path)
         self.session = MultiCamSession(
             n_slots=n_slots,
-            out_dir=out_dir or DEFAULT_SAVE_FOLDER,
+            out_dir=out_dir or settings.default_save_folder,
         )
-        self.session.station = self.settings["station"]
+        self.session.station = settings.station
         self.cards: list[CameraCard] = []
         self.busy = False
         self._stopping = False
@@ -182,7 +157,7 @@ class UnifiedApp:
         root.resize(1240, 860)
         root.setMinimumSize(980, 700)
         root.close_handler = self._on_close
-        set_font_size(QApplication.instance(), self.settings["font_size"])
+        set_font_size(QApplication.instance(), settings.font_size)
 
         central = QWidget(root)
         central.setObjectName("central")
@@ -296,15 +271,15 @@ class UnifiedApp:
         self.station_combo = NoWheelComboBox()
         self.station_combo.setMinimumContentsLength(10)
         self.station_combo.addItem("Not set", "")
-        for station in STATIONS:
+        for station in settings.stations:
             self.station_combo.addItem(station, station)
-        self.station_combo.setCurrentIndex(self.station_combo.findData(self.settings["station"]))
+        self.station_combo.setCurrentIndex(self.station_combo.findData(settings.station))
         self.station_combo.activated.connect(lambda index: self._set_station(self.station_combo.itemData(index)))
         self.slots_combo = NoWheelComboBox()
         self.slots_combo.setMinimumContentsLength(4)
-        for count in CAMERA_SLOT_CHOICES:
+        for count in range(settings.camera_slot_range[0], settings.camera_slot_range[1] + 1):
             self.slots_combo.addItem(str(count), count)
-        self.slots_combo.setCurrentIndex(self.slots_combo.findData(self.settings["camera_slots"]))
+        self.slots_combo.setCurrentIndex(self.slots_combo.findData(settings.camera_slots))
         self.slots_combo.activated.connect(lambda index: self._save_setting("camera_slots", self.slots_combo.itemData(index)))
         return [
             ("Station", self.station_combo, "Written into each recording report."),
@@ -316,7 +291,7 @@ class UnifiedApp:
     def _interface_rows(self) -> list[tuple[str, NoWheelComboBox, str]]:
         self.font_size_combo = NoWheelComboBox()
         self.font_size_combo.setMinimumContentsLength(6)
-        for size in range(FONT_SIZE_RANGE[0], FONT_SIZE_RANGE[1] + 1):
+        for size in range(settings.font_size_range[0], settings.font_size_range[1] + 1):
             self.font_size_combo.addItem(f"{size} pt", size)
         self.font_size_combo.setCurrentIndex(self.font_size_combo.findData(font_size()))
         self.font_size_combo.activated.connect(lambda index: self._set_font_size(self.font_size_combo.itemData(index)))
@@ -331,9 +306,9 @@ class UnifiedApp:
         self._save_setting("font_size", size)
 
     def _save_setting(self, key: str, value) -> None:
-        self.settings[key] = value
+        setattr(settings, key, value)
         if self.settings_path is not None:
-            save_settings(self.settings_path, self.settings)
+            save_settings(self.settings_path)
 
     # The Save folder of the Setup tab is saved, so the next start opens with it.
     def _remember_save_folder(self) -> None:
@@ -341,7 +316,7 @@ class UnifiedApp:
         if not folder:
             return
         folder = str(Path(folder).expanduser().resolve())
-        if folder != self.settings["save_folder"]:
+        if folder != settings.save_folder:
             self._save_setting("save_folder", folder)
 
     def _build_setup(self) -> None:
@@ -1511,18 +1486,31 @@ def main() -> None:
     parser.add_argument("--slots", type=int, default=None, help="Initial camera slots (>=2); default: the Camera slots at start setting")
     parser.add_argument("--out-dir", type=Path, default=None, help="Save folder; default: the last Save folder")
     args = parser.parse_args()
+    # A bad settings.json does not stop the start: the app uses the defaults and names each bad key.
+    settings_error = ""
+    try:
+        load_settings(settings.settings_path)
+    except ValidationError as exc:
+        settings_error = "\n".join(f"{'.'.join(map(str, error['loc'])) or 'file'}: {error['msg']}" for error in exc.errors())
+        logger.warning("Bad settings file %s, the defaults are used: %s", settings.settings_path, settings_error)
     # A value on the command line comes first, then the saved setting, then the default.
-    settings = load_settings(SETTINGS_PATH)
-    slots = args.slots if args.slots is not None else settings["camera_slots"]
+    slots = args.slots if args.slots is not None else settings.camera_slots
     if slots < 2:
         parser.error("--slots must be >= 2")
-    out_dir = args.out_dir or (Path(settings["save_folder"]) if settings["save_folder"] else DEFAULT_SAVE_FOLDER)
+    out_dir = args.out_dir or (Path(settings.save_folder) if settings.save_folder else settings.default_save_folder)
     app = QApplication(sys.argv[:1])
     use_english_numbers()
     ui_bridge.install()
     root = AppWindow()
-    UnifiedApp(root, n_slots=slots, out_dir=out_dir, settings_path=SETTINGS_PATH)
+    UnifiedApp(root, n_slots=slots, out_dir=out_dir, settings_path=settings.settings_path)
     root.showMaximized()
+    if settings_error:
+        QMessageBox.warning(
+            root,
+            "Settings",
+            f"{settings.settings_path} has a bad value, so the app uses the default settings.\n"
+            f"The next change on the Settings tab replaces the file.\n\n{settings_error}",
+        )
     app.exec()
 
 

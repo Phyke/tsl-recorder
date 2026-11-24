@@ -14,15 +14,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from recorder.config import settings
+
 logger = logging.getLogger("poc1.bag")
 
 # Cached after first successful probe: ".bag" or ".db3"
 # Default .db3 — modern pyrealsense2 rejects .bag with:
 #   "Output file must have .db3 extension"
 _RECORD_SUFFIX: Optional[str] = ".db3"
-
-# The last build number of poc1 (realsense-recorder 93df15b, "sdk-record-v44-2026-10-12"). The count goes on from it.
-POC1_LAST_BUILD = 44
 
 
 def _git(*args: str) -> str:
@@ -40,14 +39,14 @@ def _git(*args: str) -> str:
 
 
 # Build stamp so operators can confirm which code runs: "sdk-record-v{number}-{commit date} {short hash}".
-# The number is POC1_LAST_BUILD plus the commit count, so each commit adds 1. With no git (or no repository), the stamp is "unknown commit".
+# The number is settings.poc1_last_build plus the commit count, so each commit adds 1. With no git (or no repository), the stamp is "unknown commit".
 def _build_id() -> str:
     try:
         count = int(_git("rev-list", "--count", "HEAD"))
         commit_hash, commit_date = _git("log", "-1", "--date=short", "--format=%h %cd").split()
     except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError):
         return "unknown commit"
-    return f"sdk-record-v{POC1_LAST_BUILD + count}-{commit_date} {commit_hash}"
+    return f"sdk-record-v{settings.poc1_last_build + count}-{commit_date} {commit_hash}"
 
 
 BUILD_ID = _build_id()

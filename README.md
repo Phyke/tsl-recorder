@@ -24,10 +24,17 @@ The Settings tab saves its values in `settings.json` in the project folder. Each
 - General: Camera slots at start (2 to 8). The change applies at the next start.
 - Interface: Font size (8 to 24 pt, default 16). The change applies at once.
 - The Save folder on the Setup tab is also saved when it changes.
+- If `settings.json` has a bad value, the app starts with the default settings and shows the bad key. The next change on the Settings tab replaces the file.
+
+`src/recorder/config.py` holds all the settings in one object, `settings`. Each module reads `settings.<name>`.
+
+- The fields (`font_size`, `save_folder`, `camera_slots`, `station`) come from `settings.json`.
+- The fixed values (for example `dshow_rtbufsize`, `preview_hz`, `uvc_preset_modes`) are in git, so both stations use the same values. `settings.json` cannot change them.
 
 ## Layout
 
 - `src/recorder/gui.py`: the main window (Setup, Record, and Library pages).
+- `src/recorder/config.py`: the settings and the fixed values.
 - `src/recorder/cards.py`: the camera card on the Setup page.
 - `src/recorder/library.py`: the Library page (browse, play, and export to MP4).
 - `src/recorder/review.py`: the review prompt after a recording is saved.

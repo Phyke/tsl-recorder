@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from recorder.config import settings
+
 # Calm light shell — readable, not a debug console.
 BG = "#eef2f6"
 PANEL = "#ffffff"
@@ -39,11 +41,9 @@ FIELD = "#ffffff"
 # The Windows gray text color, which a disabled Tk Checkbutton uses.
 DISABLED_TEXT = "#6d6d6d"
 
-# The size of the base text in points (poc1 uses Segoe UI 9). The Settings tab changes it, and each font follows in proportion.
-BASE_FONT_SIZE = 9
-DEFAULT_FONT_SIZE = 16
-FONT_SIZE_RANGE = (8, 24)
-_font_size = DEFAULT_FONT_SIZE
+# The size of the base text in points, as the widgets use it now (poc1 uses Segoe UI 9, settings.base_font_size).
+# The Settings tab changes it, and each font follows in proportion.
+_font_size = settings.font_size
 
 _names = itertools.count(1)
 
@@ -52,10 +52,10 @@ def apply_styles(app: QApplication) -> None:
     # Tk ignores the Windows dark mode, so the Qt palette stays light too.
     app.styleHints().setColorScheme(Qt.ColorScheme.Light)
     app.setStyle("Fusion")
-    app.setFont(font(("Segoe UI", BASE_FONT_SIZE)))
+    app.setFont(font(("Segoe UI", settings.base_font_size)))
     # A message box uses the base text size, so it follows the Interface font size.
     message_font = f'font-family: "Segoe UI"; font-size: {_font_size}pt;'
-    tab_size = 10 * _font_size / BASE_FONT_SIZE
+    tab_size = 10 * _font_size / settings.base_font_size
     app.setStyleSheet(
         f"""
         QComboBox {{ background: {FIELD}; color: {INK}; border: 1px solid {BORDER}; padding: 3px 6px; }}
@@ -76,7 +76,7 @@ def apply_styles(app: QApplication) -> None:
 
 def _sized_font(family: str, size: int) -> QFont:
     result = QFont(family)
-    result.setPointSizeF(size * _font_size / BASE_FONT_SIZE)
+    result.setPointSizeF(size * _font_size / settings.base_font_size)
     return result
 
 
@@ -91,7 +91,7 @@ def font_size() -> int:
 # A new font size applies at once: the app font and the styles, each widget with a font of its own, and each text size.
 def set_font_size(app: QApplication, size: int) -> None:
     global _font_size
-    old_scale = _font_size / BASE_FONT_SIZE
+    old_scale = _font_size / settings.base_font_size
     widgets = app.allWidgets()
     own_font = [w for w in widgets if w.testAttribute(Qt.WidgetAttribute.WA_SetFont) and w.font().pointSizeF() > 0]
     # Each size at the base font size, kept before any font changes, because Qt copies some fonts (a combo box to its list) on a change.
@@ -101,7 +101,7 @@ def set_font_size(app: QApplication, size: int) -> None:
     _font_size = size
     for widget in own_font:
         widget_font = widget.font()
-        widget_font.setPointSizeF(widget.property("unscaled_point_size") * size / BASE_FONT_SIZE)
+        widget_font.setPointSizeF(widget.property("unscaled_point_size") * size / settings.base_font_size)
         widget.setFont(widget_font)
     # The styles come last: they copy some parent fonts into Qt parts (the inner area of a list), so the parent fonts must be new first.
     apply_styles(app)
@@ -226,7 +226,7 @@ def button(
 class NoWheelComboBox(QComboBox):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setFont(font(("Segoe UI", BASE_FONT_SIZE)))
+        self.setFont(font(("Segoe UI", settings.base_font_size)))
         self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.setMinimumContentsLength(20)
 

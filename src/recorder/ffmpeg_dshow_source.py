@@ -19,6 +19,7 @@ from typing import Optional
 
 import numpy as np
 
+from recorder.config import settings
 from recorder.frame_layout import (
     frame_bytes,
     pipe_pix_fmt_for_fps,
@@ -26,9 +27,6 @@ from recorder.frame_layout import (
 )
 
 logger = logging.getLogger("poc1.ffmpeg_dshow")
-
-# DirectShow input buffer — 150M caused ~1–3s preview lag vs RealSense.
-DSHOW_RTBUFSIZE = "20M"
 
 # Elgato MJPEG is an input *codec* on dshow (-vcodec mjpeg), not -pixel_format mjpeg.
 InputMode = str  # "vcodec_mjpeg" | "pixel_yuyv422" | "none"
@@ -228,7 +226,7 @@ class FfmpegDshowCaptureSource:
             "-f",
             "dshow",
             "-rtbufsize",
-            DSHOW_RTBUFSIZE,
+            settings.dshow_rtbufsize,
         ]
         size_args = ["-video_size", f"{self.width}x{self.height}"]
         fps_args = ["-framerate", str(self.target_fps)]

@@ -17,6 +17,7 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
+from recorder.config import settings
 from recorder.win_names import (
     classify_capture_name,
     clear_name_cache,
@@ -59,21 +60,6 @@ def clear_preview_cancel() -> None:
 
 def preview_cancel_requested() -> bool:
     return _preview_cancel.is_set()
-
-# Sensible presets when the driver does not expose a full mode list.
-_UVC_PRESET_MODES: list[tuple[int, int, int, str]] = [
-    (1280, 720, 30, "mjpg"),
-    (640, 480, 30, "mjpg"),
-    (1280, 720, 30, "yuyv"),
-    (640, 480, 30, "yuyv"),
-    (1280, 720, 30, "bgr8"),
-    (640, 480, 30, "bgr8"),
-    (1920, 1080, 30, "mjpg"),
-    (1920, 1080, 30, "bgr8"),
-    (1280, 720, 60, "mjpg"),
-    (1920, 1080, 60, "mjpg"),
-    (1920, 1080, 120, "mjpg"),
-]
 
 
 @dataclass(frozen=True)
@@ -706,7 +692,7 @@ def list_uvc_modes(camera: ConnectedCamera) -> list[StreamMode]:
             StreamMode(1280, 720, 60, "mjpg"),
         ]
     modes = list(preferred)
-    for w, h, fps, fmt in _UVC_PRESET_MODES:
+    for w, h, fps, fmt in settings.uvc_preset_modes:
         candidate = StreamMode(w, h, fps, fmt)
         if candidate not in modes:
             modes.append(candidate)
