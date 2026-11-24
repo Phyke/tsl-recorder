@@ -60,6 +60,7 @@ from recorder.theme import (
     BG,
     BLUE,
     BORDER,
+    DEFAULT_FONT_SIZE,
     FONT_SIZE_RANGE,
     GREEN,
     INK,
@@ -68,7 +69,6 @@ from recorder.theme import (
     RED,
     SURFACE,
     NoWheelComboBox,
-    apply_styles,
     button,
     font,
     font_size,
@@ -89,6 +89,30 @@ from recorder.ui_bridge import call_in_ui
 
 configure_app_logging()
 logger = logging.getLogger("poc1.app")
+
+# The settings of this PC (font size, Save folder, camera slots at start, station), saved by the app.
+# Not in git: each station has its own file.
+SETTINGS_PATH = Path(__file__).resolve().parents[2] / "settings.json"
+DEFAULT_SAVE_FOLDER = Path("./recordings/deliverable1")
+STATIONS = ["Station A", "Station B"]
+CAMERA_SLOT_CHOICES = range(2, 9)
+DEFAULT_SETTINGS = {
+    "font_size": DEFAULT_FONT_SIZE,
+    "save_folder": "",
+    "camera_slots": 2,
+    "station": "",
+}
+
+
+# With no path (a test run), the settings are the defaults.
+def load_settings(path: Path | None) -> dict:
+    if path is None or not path.exists():
+        return dict(DEFAULT_SETTINGS)
+    return DEFAULT_SETTINGS | json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_settings(path: Path, settings: dict) -> None:
+    path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
 
 def _ask_yes_no(parent: QWidget, title: str, text: str) -> bool:
@@ -135,12 +159,16 @@ class _WheelFilter(QObject):
 class UnifiedApp:
     """One comfortable shell over the existing multi-cam + library pipelines."""
 
-    def __init__(self, root: AppWindow, n_slots: int = 2, out_dir: Path | None = None):
+    def __init__(self, root: AppWindow, n_slots: int = 2, out_dir: Path | None = None, settings_path: Path | None = None):
         self.root = root
+        # With no settings_path (a test run), the settings are the defaults and no change is saved.
+        self.settings_path = settings_path
+        self.settings = load_settings(settings_path)
         self.session = MultiCamSession(
             n_slots=n_slots,
-            out_dir=out_dir or Path("./recordings/deliverable1"),
+            out_dir=out_dir or DEFAULT_SAVE_FOLDER,
         )
+        self.session.station = self.settings["station"]
         self.cards: list[CameraCard] = []
         self.busy = False
         self._stopping = False
@@ -154,7 +182,7 @@ class UnifiedApp:
         root.resize(1240, 860)
         root.setMinimumSize(980, 700)
         root.close_handler = self._on_close
-        apply_styles(QApplication.instance())
+        set_font_size(QApplication.instance(), self.settings["font_size"])
 
         central = QWidget(root)
         central.setObjectName("central")
@@ -242,13 +270,21 @@ class UnifiedApp:
             f"QListWidget::item:selected {{ background: {ACCENT_SOFT}; color: {ACCENT}; }}"
         )
         self.settings_stack = QStackedWidget()
-        for name in ("General", "Interface"):
+        for name, rows in (("General", self._general_rows()), ("Interface", self._interface_rows())):
             self.settings_list.addItem(name)
             page, page_layout = frame(None, PANEL, border=True, padx=16, pady=12)
             page_layout.addWidget(label(page, name, fg=INK, font_spec=("Segoe UI Semibold", 12)))
-            if name == "Interface":
-                page_layout.addSpacing(12)
-                page_layout.addLayout(self._font_size_row())
+            page_layout.addSpacing(12)
+            # One row for each setting: the name, the list of choices, and a note.
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(8)
+            for index, (text, combo, note) in enumerate(rows):
+                grid.addWidget(label(page, text, fg=INK), index, 0)
+                grid.addWidget(combo, index, 1)
+                grid.addWidget(label(page, note, fg=MUTED), index, 2)
+            grid.setColumnStretch(3, 1)
+            page_layout.addLayout(grid)
             page_layout.addStretch(1)
             self.settings_stack.addWidget(page)
         self.settings_list.currentRowChanged.connect(self.settings_stack.setCurrentIndex)
@@ -256,23 +292,57 @@ class UnifiedApp:
         row.addWidget(self.settings_list)
         row.addWidget(self.settings_stack, 1)
 
+    def _general_rows(self) -> list[tuple[str, NoWheelComboBox, str]]:
+        self.station_combo = NoWheelComboBox()
+        self.station_combo.setMinimumContentsLength(10)
+        self.station_combo.addItem("Not set", "")
+        for station in STATIONS:
+            self.station_combo.addItem(station, station)
+        self.station_combo.setCurrentIndex(self.station_combo.findData(self.settings["station"]))
+        self.station_combo.activated.connect(lambda index: self._set_station(self.station_combo.itemData(index)))
+        self.slots_combo = NoWheelComboBox()
+        self.slots_combo.setMinimumContentsLength(4)
+        for count in CAMERA_SLOT_CHOICES:
+            self.slots_combo.addItem(str(count), count)
+        self.slots_combo.setCurrentIndex(self.slots_combo.findData(self.settings["camera_slots"]))
+        self.slots_combo.activated.connect(lambda index: self._save_setting("camera_slots", self.slots_combo.itemData(index)))
+        return [
+            ("Station", self.station_combo, "Written into each recording report."),
+            ("Camera slots at start", self.slots_combo, "Applies at the next start."),
+        ]
+
     # The font size of the whole app, in points of the base text. A size picked from the list applies at once.
     # A list and not a spin box: a font change moves the whole page, so spin box arrows move away from the mouse after each click.
-    def _font_size_row(self) -> QHBoxLayout:
-        size_row = QHBoxLayout()
-        size_row.setSpacing(8)
-        size_row.addWidget(label(None, "Font size", fg=INK))
+    def _interface_rows(self) -> list[tuple[str, NoWheelComboBox, str]]:
         self.font_size_combo = NoWheelComboBox()
         self.font_size_combo.setMinimumContentsLength(6)
         for size in range(FONT_SIZE_RANGE[0], FONT_SIZE_RANGE[1] + 1):
             self.font_size_combo.addItem(f"{size} pt", size)
         self.font_size_combo.setCurrentIndex(self.font_size_combo.findData(font_size()))
-        self.font_size_combo.activated.connect(
-            lambda index: set_font_size(QApplication.instance(), self.font_size_combo.itemData(index))
-        )
-        size_row.addWidget(self.font_size_combo)
-        size_row.addStretch(1)
-        return size_row
+        self.font_size_combo.activated.connect(lambda index: self._set_font_size(self.font_size_combo.itemData(index)))
+        return [("Font size", self.font_size_combo, "")]
+
+    def _set_station(self, station: str) -> None:
+        self.session.station = station
+        self._save_setting("station", station)
+
+    def _set_font_size(self, size: int) -> None:
+        set_font_size(QApplication.instance(), size)
+        self._save_setting("font_size", size)
+
+    def _save_setting(self, key: str, value) -> None:
+        self.settings[key] = value
+        if self.settings_path is not None:
+            save_settings(self.settings_path, self.settings)
+
+    # The Save folder of the Setup tab is saved, so the next start opens with it.
+    def _remember_save_folder(self) -> None:
+        folder = self.out_entry.text().strip()
+        if not folder:
+            return
+        folder = str(Path(folder).expanduser().resolve())
+        if folder != self.settings["save_folder"]:
+            self._save_setting("save_folder", folder)
 
     def _build_setup(self) -> None:
         page = QVBoxLayout(self.setup_page)
@@ -298,6 +368,7 @@ class UnifiedApp:
         folder_row.addSpacing(10)
         self.out_entry = QLineEdit(str(self.session.out_dir.resolve()), folder)
         self.out_entry.setFont(font(("Segoe UI", 9)))
+        self.out_entry.editingFinished.connect(self._remember_save_folder)
         folder_row.addWidget(self.out_entry, 1)
         folder_row.addSpacing(10)
         folder_row.addWidget(button(folder, "Browse…", self.browse_folder, color="#475569"))
@@ -579,6 +650,7 @@ class UnifiedApp:
             self.out_entry.setText(chosen)
             self.session.set_out_dir(chosen)
             self.library.sync_folder(Path(chosen))
+            self._remember_save_folder()
 
     def _sync_all(self) -> None:
         self.session.set_out_dir(self.out_entry.text())
@@ -1436,18 +1508,20 @@ def use_english_numbers() -> None:
 def main() -> None:
     silence_opencv()
     parser = argparse.ArgumentParser(description="POC1 Recorder — unified Setup / Record / Library")
-    parser.add_argument("--slots", type=int, default=2, help="Initial camera slots (>=2)")
-    parser.add_argument(
-        "--out-dir", type=Path, default=Path("./recordings/deliverable1")
-    )
+    parser.add_argument("--slots", type=int, default=None, help="Initial camera slots (>=2); default: the Camera slots at start setting")
+    parser.add_argument("--out-dir", type=Path, default=None, help="Save folder; default: the last Save folder")
     args = parser.parse_args()
-    if args.slots < 2:
+    # A value on the command line comes first, then the saved setting, then the default.
+    settings = load_settings(SETTINGS_PATH)
+    slots = args.slots if args.slots is not None else settings["camera_slots"]
+    if slots < 2:
         parser.error("--slots must be >= 2")
+    out_dir = args.out_dir or (Path(settings["save_folder"]) if settings["save_folder"] else DEFAULT_SAVE_FOLDER)
     app = QApplication(sys.argv[:1])
     use_english_numbers()
     ui_bridge.install()
     root = AppWindow()
-    UnifiedApp(root, n_slots=args.slots, out_dir=args.out_dir)
+    UnifiedApp(root, n_slots=slots, out_dir=out_dir, settings_path=SETTINGS_PATH)
     root.showMaximized()
     app.exec()
 

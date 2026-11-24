@@ -13,8 +13,17 @@ uv run recorder
 
 Options:
 
-- `--slots N`: the number of camera slots at the start (2 or more, default 2).
-- `--out-dir PATH`: the save folder (default `./recordings/deliverable1`).
+- `--slots N`: the number of camera slots at the start (2 or more). Default: the "Camera slots at start" setting (2).
+- `--out-dir PATH`: the save folder. Default: the last Save folder, else `./recordings/deliverable1`.
+
+## Settings
+
+The Settings tab saves its values in `settings.json` in the project folder. Each station PC has its own file, so git does not track it.
+
+- General: Station (Not set, Station A, Station B). Record writes it into each recording report as `station`.
+- General: Camera slots at start (2 to 8). The change applies at the next start.
+- Interface: Font size (8 to 24 pt, default 16). The change applies at once.
+- The Save folder on the Setup tab is also saved when it changes.
 
 ## Layout
 

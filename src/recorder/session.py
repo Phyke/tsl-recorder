@@ -140,6 +140,8 @@ class MultiCamSession:
         # Authoritative .bag intent for the next/current Record (slot_id -> bool).
         # UI checkboxes can race with busy/lock; Record uses this map only.
         self.bag_intent: dict[int, bool] = {}
+        # The station name from the Settings tab ("" when not set). Record writes it into each recording report.
+        self.station = ""
 
     @property
     def is_recording(self) -> bool:
@@ -540,6 +542,7 @@ class MultiCamSession:
 
                 for s, mp4, csv, bag in jobs:
                     assert s.pipeline is not None
+                    s.pipeline.station = self.station
                     try:
                         s.pipeline.start_recording(mp4, csv, bag_path=bag, hold=True)
                     except Exception as exc:

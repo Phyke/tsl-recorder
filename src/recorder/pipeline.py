@@ -98,6 +98,8 @@ class Pipeline:
     on_preview_frame: Callable[[FrameEnvelope], None]
     output_path: Optional[Path] = None
     monitor_csv: Optional[Path] = None
+    # The station name ("" when not set); the session sets it before each Record, and the report writes it.
+    station: str = ""
 
     def __post_init__(self) -> None:
         self.camera_handler = CameraHandler(source=self.source)
@@ -581,6 +583,7 @@ class Pipeline:
         )
         hdmi_not_120 = bool(tag == "elgato" and requested >= 90 and measured < requested * 0.85)
         return {
+            "station": self.station,
             "frames_read_by_camera": read,
             "frames_processed": self.processor.frames_processed,
             "frames_written": written,
