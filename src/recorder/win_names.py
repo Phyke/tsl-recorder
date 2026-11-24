@@ -5,13 +5,15 @@ OpenCV only exposes numeric indices. This helper maps those indices to the
 names Windows/DirectShow advertises (Elgato, OBS, Integrated Camera, …).
 On Windows, OpenCV can also open by name: VideoCapture("video=<name>", CAP_DSHOW).
 """
-from __future__ import annotations
 
 import logging
 import re
+import shutil
 import subprocess
 import sys
 from functools import lru_cache
+
+from recorder.ffmpeg_dshow_source import find_ffmpeg
 
 logger = logging.getLogger("poc1.d1.win_names")
 
@@ -68,10 +70,14 @@ def _classify(name: str) -> str:
 
 def _names_from_ffmpeg() -> list[str]:
     names: list[str] = []
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        logger.debug("ffmpeg device list unavailable: ffmpeg not found")
+        return names
     try:
-        proc = subprocess.run(
+        proc = subprocess.run(  # noqa: S603
             [
-                "ffmpeg",
+                ffmpeg,
                 "-hide_banner",
                 "-list_devices",
                 "true",
@@ -122,9 +128,13 @@ foreach ($c in $classes) {
   }
 }
 """
+    powershell = shutil.which("powershell")
+    if powershell is None:
+        logger.debug("PnP camera list unavailable: powershell not found")
+        return names
     try:
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
+        proc = subprocess.run(  # noqa: S603
+            [powershell, "-NoProfile", "-Command", ps],
             capture_output=True,
             text=True,
             timeout=12,
@@ -206,11 +216,7 @@ def dshow_open_path(index: int) -> str | None:
 def dshow_open_paths_for_tag(tag: str) -> list[str]:
     """All DirectShow open paths whose friendly name classifies as tag."""
     names, _aligned = _windows_capture_inventory()
-    out: list[str] = []
-    for name in names:
-        if _classify(name) == tag:
-            out.append(f"video={name}")
-    return out
+    return [f"video={name}" for name in names if _classify(name) == tag]
 
 
 def ffmpeg_available() -> bool:

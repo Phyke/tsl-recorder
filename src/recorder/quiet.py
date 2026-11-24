@@ -1,5 +1,4 @@
 """Silence OpenCV / FFmpeg console noise as early as possible."""
-from __future__ import annotations
 
 import logging
 import os
@@ -19,7 +18,7 @@ def silence_opencv() -> None:
             cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
         elif hasattr(cv2, "setLogLevel") and hasattr(cv2, "LOG_LEVEL_ERROR"):
             cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
-    except Exception:
+    except ImportError:
         pass
 
 

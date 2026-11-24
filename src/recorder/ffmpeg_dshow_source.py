@@ -5,8 +5,8 @@ OpenCV CAP_DSHOW often soft-opens ~60 while OBS/ffmpeg lock 120 on the same HDMI
 This module spawns ``ffmpeg -f dshow`` and reads raw frames from stdout (NV12 at
 ≥90fps to halve pipe bandwidth; BGR24 otherwise).
 """
-from __future__ import annotations
 
+import contextlib
 import logging
 import queue
 import shutil
@@ -143,14 +143,17 @@ class FfmpegDshowCaptureSource:
 
     def start(self) -> None:
         if sys.platform != "win32":
-            raise RuntimeError("ffmpeg DirectShow capture is Windows-only")
+            msg = "ffmpeg DirectShow capture is Windows-only"
+            raise RuntimeError(msg)
         if not self._ffmpeg:
-            raise RuntimeError(
+            msg = (
                 "ffmpeg not found on PATH — install ffmpeg so Elgato can open at 1080p120 "
                 "(same pin OBS uses)."
             )
+            raise RuntimeError(msg)
         if not self._device_names:
-            raise RuntimeError("No DirectShow device name for ffmpeg Elgato capture")
+            msg = "No DirectShow device name for ffmpeg Elgato capture"
+            raise RuntimeError(msg)
 
         want = self.target_fps
         threshold = _lock_threshold(want)
@@ -201,10 +204,11 @@ class FfmpegDshowCaptureSource:
                         threshold,
                     )
 
-        raise RuntimeError(
+        msg = (
             f"ffmpeg could not lock Elgato at {self.width}x{self.height}@{want} "
             f"(last: {last_err}). Confirm HDMI is 1080p120 and OBS is fully exited."
         )
+        raise RuntimeError(msg)
 
     def _build_cmd(self, device: str, input_mode: InputMode) -> list[str]:
         """OBS-style dshow pin — framerate before size, vcodec mjpeg for Elgato."""
@@ -213,7 +217,9 @@ class FfmpegDshowCaptureSource:
     def _build_cmd_variant(
         self, device: str, input_mode: InputMode, *, fps_first: bool
     ) -> list[str]:
-        assert self._ffmpeg
+        if not self._ffmpeg:
+            msg = "ffmpeg not found on PATH"
+            raise RuntimeError(msg)
         head = [
             self._ffmpeg,
             "-hide_banner",
@@ -255,7 +261,7 @@ class FfmpegDshowCaptureSource:
         creationflags = 0
         if sys.platform == "win32":
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        return subprocess.Popen(
+        return subprocess.Popen(  # noqa: S603
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -266,7 +272,7 @@ class FfmpegDshowCaptureSource:
     def _try_open(self, device: str, input_mode: InputMode, measure_s: float) -> float:
         last_rate = 0.0
         for cmd in self._cmd_variants(device, input_mode):
-            rate = self._try_open_cmd(cmd, input_mode, measure_s)
+            rate = self._try_open_cmd(cmd, measure_s)
             last_rate = max(last_rate, rate)
             if rate >= _lock_threshold(self.target_fps):
                 return rate
@@ -274,7 +280,7 @@ class FfmpegDshowCaptureSource:
         return last_rate
 
     def _try_open_cmd(
-        self, cmd: list[str], input_mode: InputMode, measure_s: float
+        self, cmd: list[str], measure_s: float
     ) -> float:
         logger.info("ffmpeg dshow try: %s", " ".join(cmd[1:18]))
         proc = self._spawn(cmd)
@@ -313,13 +319,11 @@ class FfmpegDshowCaptureSource:
                 break
             n += 1
         elapsed = max(time.perf_counter() - t0, 0.05)
-        rate = (n - 1) / elapsed if n >= 2 else (n / elapsed if n >= 1 and elapsed > 0.2 else 0.0)
+        rate = (n - 1) / elapsed if n >= 2 else (n / elapsed if n >= 1 and elapsed > settings.single_frame_rate_min_s else 0.0)  # noqa: PLR2004
         if proc.poll() is not None and n == 0:
             err = ""
-            try:
+            with contextlib.suppress(OSError, ValueError):
                 err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[:400]
-            except Exception:  # noqa: BLE001
-                pass
             raise RuntimeError(err or "ffmpeg exited with no frames")
         return rate
 
@@ -331,8 +335,8 @@ class FfmpegDshowCaptureSource:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
                     logger.debug("ffmpeg: %s", text)
-        except Exception:  # noqa: BLE001
-            pass
+        except (OSError, ValueError):
+            logger.warning("The ffmpeg stderr reader stopped", exc_info=True)
 
     def _reader_loop(self) -> None:
         proc = self._proc
@@ -352,19 +356,13 @@ class FfmpegDshowCaptureSource:
                 try:
                     self._queue.put_nowait(owned)
                 except queue.Full:
-                    try:
+                    with contextlib.suppress(queue.Empty):
                         self._queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
+                    with contextlib.suppress(queue.Full):
                         self._queue.put_nowait(owned)
-                    except queue.Full:
-                        pass
         finally:
-            try:
+            with contextlib.suppress(queue.Full):
                 self._queue.put_nowait(None)
-            except queue.Full:
-                pass
 
     def _seek_live_edge(self) -> None:
         """Discard buffered frames from lock/measure; keep only the newest."""
@@ -430,17 +428,13 @@ class FfmpegDshowCaptureSource:
         proc = self._proc
         self._proc = None
         if proc is not None:
-            try:
+            with contextlib.suppress(OSError):
                 proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
             try:
                 proc.wait(timeout=2.0)
             except Exception:  # noqa: BLE001
-                try:
+                with contextlib.suppress(OSError):
                     proc.kill()
-                except Exception:  # noqa: BLE001
-                    pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None

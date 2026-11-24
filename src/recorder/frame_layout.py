@@ -1,5 +1,4 @@
 """Raw frame layouts from ffmpeg pipe / capture (BGR vs NV12)."""
-from __future__ import annotations
 
 import cv2
 import numpy as np
@@ -32,18 +31,20 @@ def reshape_raw_frame(
 
 
 def is_nv12_frame(frame: np.ndarray, height: int, width: int) -> bool:
-    if frame is None or frame.ndim != 2:
+    if frame is None or frame.ndim != 2:  # noqa: PLR2004
         return False
     h, w = int(height), int(width)
     return frame.shape == (h * 3 // 2, w)
 
 
-def ensure_bgr(frame: np.ndarray, height: int = 0, width: int = 0) -> np.ndarray:
+def ensure_bgr(frame: np.ndarray) -> np.ndarray:
     """Convert NV12 pipe frames to BGR; pass BGR through unchanged."""
     if frame is None:
-        raise ValueError("frame is None")
-    if frame.ndim == 3 and frame.shape[2] == 3:
+        msg = "frame is None"
+        raise ValueError(msg)
+    if frame.ndim == 3 and frame.shape[2] == 3:  # noqa: PLR2004
         return frame
-    if frame.ndim == 2:
+    if frame.ndim == 2:  # noqa: PLR2004
         return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_NV12)
-    raise ValueError(f"unsupported frame shape {frame.shape}")
+    msg = f"unsupported frame shape {frame.shape}"
+    raise ValueError(msg)

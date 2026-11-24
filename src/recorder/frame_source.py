@@ -5,7 +5,6 @@ Any camera in the pipeline (real webcam, virtual cam, RealSense, or a
 synthetic generator) implements this same interface, so CameraHandler never
 needs to know which one it's talking to.
 """
-from __future__ import annotations
 
 import time
 from dataclasses import dataclass
@@ -13,6 +12,8 @@ from typing import Protocol
 
 import cv2
 import numpy as np
+
+from recorder.config import settings
 
 
 class FrameSource(Protocol):
@@ -58,13 +59,13 @@ def read_seq_barcode(frame: np.ndarray) -> int | None:
         block = frame[2:_BAR_H - 2, x0 + 2:x0 + _BAR_BIT_W - 2]
         if block.size == 0:
             return None
-        if float(block.mean()) > 127.0:
+        if float(block.mean()) > settings.barcode_bit_threshold:
             seq |= 1 << (31 - bit)
     return seq
 
 def embed_status_banner(frame: np.ndarray, text: str) -> None:
     """Large on-frame banner so simulation/loopback is obvious in the GUI."""
-    h, w = frame.shape[:2]
+    h = frame.shape[0]
     y1 = max(0, h // 2 - 28)
     y2 = min(h, h // 2 + 28)
     frame[y1:y2, :] = (30, 30, 30)
@@ -101,6 +102,7 @@ class FakeFrameSource:
         self._last_emit = 0.0
         self._running = False
         self._base_frame = self._make_base_frame()
+        self._rng = np.random.default_rng()
 
     def _make_base_frame(self) -> np.ndarray | None:
         if self.pattern == "noise":
@@ -145,7 +147,7 @@ class FakeFrameSource:
         self._last_emit = time.perf_counter()
 
         frame = (
-            np.random.randint(0, 256, (self.height, self.width, 3), dtype=np.uint8)
+            self._rng.integers(0, 256, (self.height, self.width, 3), dtype=np.uint8)
             if self.pattern == "noise"
             else self._base_frame.copy()
         )

@@ -5,7 +5,6 @@ to show the newest frame, and must never be able to apply backpressure to
 the camera_handler or the recording path. If preview rendering is slow,
 frames are silently dropped here (by design), not queued up.
 """
-from __future__ import annotations
 
 import threading
 from collections.abc import Callable

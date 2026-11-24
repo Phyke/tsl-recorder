@@ -1,14 +1,15 @@
 """
 R8 — post-save review prompt that auto-dismisses after 5 seconds.
 """
-from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QVBoxLayout, QWidget
 
+from recorder.config import settings
 from recorder.theme import button, label
 
 
@@ -40,12 +41,12 @@ def show_review_prompt(
     popup.setWindowTitle(title)
     popup.setObjectName("reviewPopup")
     popup.setStyleSheet(f"QDialog#reviewPopup {{ background: {bg}; }}")
-    popup.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-    popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    popup.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on=True)
+    popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, on=True)
     popup.setModal(False)
 
-    names = "\n".join(f"• {p.name}" for p in existing[:6])
-    if len(existing) > 6:
+    names = "\n".join(f"• {p.name}" for p in existing[: settings.max_listed_files])
+    if len(existing) > settings.max_listed_files:
         names += f"\n• …and {len(existing) - 6} more"
 
     column = QVBoxLayout(popup)
@@ -89,8 +90,6 @@ def show_review_prompt(
     popup.adjustSize()
     popup.setFixedSize(popup.sizeHint())
     popup.show()
-    try:
+    with contextlib.suppress(RuntimeError):
         popup.move(parent.mapToGlobal(QPoint(0, 0)) + QPoint(40, 40))
-    except RuntimeError:
-        pass
     return popup

@@ -7,8 +7,8 @@ Wires the pipeline exactly as specified:
 Supports preview-only mode (live GUI) and recording mode (processor+recorder
 armed). Frame drops on the record path are counted; preview may drop-oldest.
 """
-from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from collections.abc import Callable
@@ -16,15 +16,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from recorder.bag_recorder import start_bag_recording, stop_bag_recording
 from recorder.camera_handler import CameraHandler, FrameEnvelope
 from recorder.config import settings
+from recorder.device_enum import quiet_opencv
 from recorder.frame_source import FrameSource
 from recorder.monitor import SystemMonitor
 from recorder.processor import Processor
 from recorder.recorder import Recorder
 from recorder.stream_viewer import StreamViewer
+from recorder.uvc_rosbag import UvcRos2Bag
 
 logger = logging.getLogger("poc1.pipeline")
 
@@ -38,8 +41,8 @@ class CvCaptureSource:
         width: int,
         height: int,
         fps: int,
-        backend=None,
-    ):
+        backend: int | None = None,
+    ) -> None:
         self.device_index = device_index
         self.width = width
         self.height = height
@@ -52,7 +55,6 @@ class CvCaptureSource:
         self.allow_fps_remux: bool = True  # webcam: fix playback when HW lies about fps
 
     def start(self) -> None:
-        from recorder.device_enum import quiet_opencv
         with quiet_opencv():
             self._cap = cv2.VideoCapture(self.device_index, self._backend)
             if not self._cap.isOpened() and self._backend == cv2.CAP_DSHOW:
@@ -60,14 +62,13 @@ class CvCaptureSource:
                 self._cap = cv2.VideoCapture(self.device_index, cv2.CAP_MSMF)
                 self._backend = cv2.CAP_MSMF
             if not self._cap.isOpened():
-                raise RuntimeError(f"Could not open capture device index={self.device_index}")
+                msg = f"Could not open capture device index={self.device_index}"
+                raise RuntimeError(msg)
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-            try:
-                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:  # noqa: BLE001
-                pass
+            if not self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1):
+                logger.warning("Camera %d: the driver refused buffer size 1", self.device_index)
             self.actual_fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0)
             self.actual_width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width)
             self.actual_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height)
@@ -85,7 +86,7 @@ class CvCaptureSource:
             self._cap.release()
             self._cap = None
 
-    def read(self):
+    def read(self) -> np.ndarray | None:
         if self._cap is None:
             return None
         ok, frame = self._cap.read()
@@ -109,9 +110,9 @@ class Pipeline:
         )
         self.recorder: Recorder | None = None
         self.monitor: SystemMonitor | None = None
-        self._preview_started = False
-        self._last_report: dict = {}
-        self._bag_path: Path | None = None
+        self.preview_started = False
+        self.last_report: dict = {}
+        self.active_bag_path: Path | None = None
         self._bag_written: Path | None = None
         self._uvc_bag = None
         self._record_held = False
@@ -120,11 +121,11 @@ class Pipeline:
         self._record_output_path: Path | None = None
 
     def start_preview(self) -> None:
-        if self._preview_started:
+        if self.preview_started:
             return
         self.viewer.start()
         self.camera_handler.start()
-        self._preview_started = True
+        self.preview_started = True
         logger.info("Preview started")
 
     def arm_sdk_bag(self, bag_path: Path) -> Path:
@@ -134,14 +135,15 @@ class Pipeline:
         """
         tag = str(getattr(self.source, "device_tag", "") or "")
         if tag == "elgato":
-            raise RuntimeError("Elgato bag starts after Record frames are flowing")
+            msg = "Elgato bag starts after Record frames are flowing"
+            raise RuntimeError(msg)
         self.camera_handler.pause_reads()
         try:
             active = start_bag_recording(self.source, bag_path)
-            self._bag_path = Path(active)
+            self.active_bag_path = Path(active)
         finally:
             self.camera_handler.resume_reads()
-        return self._bag_path
+        return self.active_bag_path
 
     def _resume_paused_bag(self) -> None:
         """Unpause the SDK recorder on the same beat as the RealSense MP4."""
@@ -157,23 +159,22 @@ class Pipeline:
             logger.exception(
                 "Could not resume paused RealSense bag; file may already be writing"
             )
-            try:
+            with contextlib.suppress(AttributeError):
                 self.source.bag_start_paused = False
-            except Exception:  # noqa: BLE001
-                pass
 
     def start_recording(
         self,
         output_path: Path,
         monitor_csv: Path,
         bag_path: Path | None = None,
+        *,
         hold: bool = False,
     ) -> None:
-        if not self._preview_started:
+        if not self.preview_started:
             self.start_preview()
         self.output_path = output_path
         self.monitor_csv = monitor_csv
-        prearmed_bag = self._bag_path
+        prearmed_bag = self.active_bag_path
         self._bag_written = None
         self._uvc_bag = None
         self.processor.sidecar_bag = None
@@ -190,18 +191,18 @@ class Pipeline:
         if bag_path is not None:
             if tag == "elgato":
                 pending_uvc_bag = Path(bag_path)
-                self._bag_path = None
+                self.active_bag_path = None
             elif prearmed_bag is not None:
-                self._bag_path = prearmed_bag
+                self.active_bag_path = prearmed_bag
             else:
                 self.camera_handler.pause_reads()
                 try:
                     active = start_bag_recording(self.source, bag_path)
-                    self._bag_path = Path(active)
+                    self.active_bag_path = Path(active)
                 finally:
                     self.camera_handler.resume_reads()
         else:
-            self._bag_path = None
+            self.active_bag_path = None
 
         # Capture cards / UVC often advertise 120 while HDMI only sends ~60.
         self._requested_fps = int(
@@ -250,9 +251,9 @@ class Pipeline:
             return
         self._record_held = False
         self.release_recording()
-        self._finish_record_arm()
+        self.finish_record_arm()
 
-    def _flush_record_start(self) -> None:
+    def flush_record_start(self) -> None:
         """Drop frames already sitting in the capture buffer before this take."""
         flush = getattr(self.source, "flush_to_live", None)
         if callable(flush):
@@ -263,7 +264,7 @@ class Pipeline:
 
     def release_recording(self) -> None:
         """Flush, then start this camera's files. Single-camera Record uses this."""
-        self._flush_record_start()
+        self.flush_record_start()
         self.commit_recording()
 
     def commit_recording(self) -> None:
@@ -272,11 +273,12 @@ class Pipeline:
         self.camera_handler.enable_recording()
         self._record_held = False
 
-    def _finish_record_arm(self) -> None:
+    def finish_record_arm(self) -> None:
         """Wait until frames are flowing, then start the Elgato ROS2 bag."""
         output_path = self._record_output_path or self.output_path
         if output_path is None:
-            raise RuntimeError("Record was released before a writer was prepared")
+            msg = "Record was released before a writer was prepared"
+            raise RuntimeError(msg)
         allow_remux = bool(self._record_allow_remux)
         monitor_csv = self.monitor_csv
         pending_uvc_bag = self._pending_uvc_bag
@@ -288,16 +290,16 @@ class Pipeline:
             )
             try:
                 self.processor.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                logger.debug("Could not stop the processor", exc_info=True)
             try:
                 self.recorder.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                logger.debug("Could not stop the recorder", exc_info=True)
             try:
                 self.monitor.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                logger.debug("Could not stop the monitor", exc_info=True)
             self.camera_handler.recover_capture()
             self.processor.configure_output(
                 output_path=output_path,
@@ -326,34 +328,33 @@ class Pipeline:
             if not self.camera_handler.wait_recorded_frames(2.5):
                 try:
                     self.camera_handler.disable_recording()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not disable recording", exc_info=True)
                 try:
                     self.processor.stop()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not stop the processor", exc_info=True)
                 try:
                     self.recorder.stop()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not stop the recorder", exc_info=True)
                 try:
                     self.monitor.stop()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not stop the monitor", exc_info=True)
                 if output_path.exists() and output_path.stat().st_size == 0:
                     output_path.unlink(missing_ok=True)
-                raise RuntimeError(
+                msg = (
                     f"Record got 0 frames from {tag or 'camera'} after capture recovery. "
                     "Stop all previews → Start preview on this camera alone → wait for "
                     "moving live video → Record with bag unchecked first."
                 )
+                raise RuntimeError(msg)
 
         if pending_uvc_bag is not None:
-            from recorder.uvc_rosbag import UvcRos2Bag
-
             self._uvc_bag = UvcRos2Bag(pending_uvc_bag)
             self._uvc_bag.start()
-            self._bag_path = pending_uvc_bag
+            self.active_bag_path = pending_uvc_bag
             self.processor.sidecar_bag = self._uvc_bag
             self._pending_uvc_bag = None
 
@@ -361,7 +362,7 @@ class Pipeline:
             "Recording started -> %s (compression=%s bag=%s fps=%s requested=%s read=%d)",
             output_path,
             self.processor.codec_label,
-            bool(self._bag_path),
+            bool(self.active_bag_path),
             self.source.target_fps,
             getattr(self, "_requested_fps", self.source.target_fps),
             int(self.camera_handler.frames_read),
@@ -383,9 +384,9 @@ class Pipeline:
             live = float(self.camera_handler.live_delivery_fps() or 0)
             if live >= settings.min_live_fps:
                 rate = max(rate, live)
-        except Exception:  # noqa: BLE001
-            pass
-        hint = float(getattr(self, "_preview_fps_hint", 0) or 0)
+        except Exception:
+            logger.debug("Could not read the live delivery fps", exc_info=True)
+        hint = float(getattr(self, "preview_fps_hint", 0) or 0)
         # Preview paint is capped (~15Hz) — only use it if we have no better signal.
         if rate < settings.min_live_fps and hint >= settings.min_live_fps:
             rate = hint
@@ -417,11 +418,11 @@ class Pipeline:
     def stop_recording(self) -> dict:
         """Stop record path, keep preview alive if it was running."""
         expected_bag = None
-        if self._bag_path is not None:
+        if self.active_bag_path is not None:
             expected_bag = (
-                getattr(self.source, "_bag_final_path", None)
-                or getattr(self.source, "_bag_path", None)
-                or self._bag_path
+                getattr(self.source, "bag_final_path", None)
+                or getattr(self.source, "active_bag_path", None)
+                or self.active_bag_path
             )
         try:
             self.camera_handler.disable_recording()
@@ -449,8 +450,8 @@ class Pipeline:
                 self._bag_written = None
                 try:
                     self.camera_handler.resume_reads()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not resume reads", exc_info=True)
         if self.processor:
             try:
                 self.processor.stop()
@@ -462,7 +463,7 @@ class Pipeline:
             try:
                 bag_dropped = int(getattr(self._uvc_bag, "dropped", 0) or 0)
                 bag_frames = int(getattr(self._uvc_bag, "frames_written", 0) or 0)
-                self._bag_written = self._uvc_bag.stop() or self._bag_path
+                self._bag_written = self._uvc_bag.stop() or self.active_bag_path
                 bag_dropped = int(getattr(self._uvc_bag, "dropped", bag_dropped) or 0)
                 bag_frames = int(getattr(self._uvc_bag, "frames_written", bag_frames) or 0)
             except Exception:
@@ -490,7 +491,7 @@ class Pipeline:
             )
         if hasattr(self, "_requested_fps"):
             report["requested_fps"] = int(self._requested_fps)
-        self._last_report = report
+        self.last_report = report
         if self.output_path:
             try:
                 if self.monitor_csv is not None:
@@ -513,14 +514,15 @@ class Pipeline:
                 self._bag_written = candidate
                 report["bag_path"] = str(candidate)
                 report["bag_recorded"] = True
-                self._last_report = report
+                self.last_report = report
             else:
-                raise RuntimeError(
+                msg = (
                     f"MP4 was saved, but RealSense .bag was not "
                     f"(expected {Path(expected_bag).name}). "
                     "Close RealSense Viewer, use USB 3, check Also save RealSense .bag, "
                     "then Record again."
                 )
+                raise RuntimeError(msg)
         # Auto-fix Elgato/webcam playback when stamp still disagrees with delivery.
         if (
             self.recorder is not None
@@ -532,7 +534,7 @@ class Pipeline:
         ):
             try:
                 if self.convert_container_fps():
-                    report = self._last_report or self.report()
+                    report = self.last_report or self.report()
             except Exception:
                 logger.exception("auto FPS convert failed")
         return report
@@ -544,8 +546,8 @@ class Pipeline:
             report = self.stop_recording()
         self.camera_handler.stop()
         self.viewer.stop()
-        self._preview_started = False
-        return report or self._last_report
+        self.preview_started = False
+        return report or self.last_report
 
     def report(self) -> dict:
         recorder_summary = self.recorder.summary() if self.recorder else {
@@ -579,7 +581,7 @@ class Pipeline:
         r7_120_ok = bool(
             tag == "elgato"
             and no_drops
-            and measured >= 110.0
+            and measured >= settings.elgato_120_min_fps
         )
         hdmi_not_120 = bool(tag == "elgato" and requested >= settings.high_rate_fps and measured < requested * 0.85)
         return {
@@ -635,5 +637,5 @@ class Pipeline:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report["report_path"] = str(report_path)
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            self._last_report = report
+            self.last_report = report
         return ok

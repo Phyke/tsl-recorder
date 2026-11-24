@@ -18,14 +18,13 @@ Fan-out matches the required pipeline shape:
 Each subscriber gets its own bounded queue so a slow viewer can never stall
 the recorder path, and vice versa.
 """
-from __future__ import annotations
 
+import contextlib
 import logging
 import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 
@@ -44,7 +43,7 @@ class FrameEnvelope:
     frame: np.ndarray
 
 
-class DropCountingQueue:
+class DropCountingQueue[T]:
     """
     A bounded queue with an explicit, measurable drop policy instead of an
     implicit one. Two modes:
@@ -59,23 +58,21 @@ class DropCountingQueue:
       what's already queued for disk, we surface that we're falling behind.
     """
 
-    def __init__(self, maxsize: int, drop_oldest: bool, name: str):
-        self._q: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+    def __init__(self, maxsize: int, *, drop_oldest: bool, name: str) -> None:
+        self._q: queue.Queue[T] = queue.Queue(maxsize=maxsize)
         self.maxsize = maxsize
         self._drop_oldest = drop_oldest
         self._name = name
         self.dropped_count = 0
         self._lock = threading.Lock()
 
-    def put(self, item: Any) -> None:
+    def put(self, item: T) -> None:
         if self._drop_oldest:
             try:
                 self._q.put_nowait(item)
             except queue.Full:
-                try:
+                with contextlib.suppress(queue.Empty):
                     self._q.get_nowait()
-                except queue.Empty:
-                    pass
                 try:
                     self._q.put_nowait(item)
                 except queue.Full:
@@ -92,7 +89,7 @@ class DropCountingQueue:
                     self._name, getattr(item, "seq", "?"), self.dropped_count,
                 )
 
-    def put_live(self, item: Any) -> None:
+    def put_live(self, item: T) -> None:
         """
         Keep capture realtime unless the queue is nearly full.
 
@@ -108,7 +105,7 @@ class DropCountingQueue:
         else:
             self.put(item)
 
-    def put_block(self, item: Any, timeout: float = 2.0) -> bool:
+    def put_block(self, item: T, timeout: float = 2.0) -> bool:
         """
         Block until there is room (no-drop path for synthetic R7 proofs).
 
@@ -127,7 +124,7 @@ class DropCountingQueue:
             return False
 
 
-    def get(self, timeout: float | None = None) -> Any | None:
+    def get(self, timeout: float | None = None) -> T | None:
         try:
             if timeout == 0:
                 return self._q.get_nowait()
@@ -172,13 +169,13 @@ class CameraHandler:
         # FHD@120 needs a deeper buffer; fake proofs prefer no-drop backpressure.
         fps = int(getattr(self.source, "target_fps", 30) or 30)
         mode = str(getattr(self.source, "mode", "") or "")
-        if mode == "fake" or fps >= 60:
+        if mode == "fake" or fps >= settings.deep_buffer_fps:
             # ~30s at 120fps plus margin so Stop can drain without mid-take drops.
             self.processor_queue_size = max(self.processor_queue_size, 4800)
-        self.viewer_queue = DropCountingQueue(
+        self.viewer_queue: DropCountingQueue[FrameEnvelope] = DropCountingQueue(
             self.viewer_queue_size, drop_oldest=True, name="viewer"
         )
-        self.processor_queue = DropCountingQueue(
+        self.processor_queue: DropCountingQueue[FrameEnvelope] = DropCountingQueue(
             self.processor_queue_size, drop_oldest=False, name="processor_in"
         )
         self._thread: threading.Thread | None = None
@@ -223,8 +220,8 @@ class CameraHandler:
                 logger.debug("flush_to_live failed", exc_info=True)
         try:
             self.viewer_queue.clear()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            logger.debug("Could not clear the viewer queue", exc_info=True)
         self._paused.clear()
 
     def enable_recording(self) -> None:
@@ -237,10 +234,8 @@ class CameraHandler:
             self._delivery_ts = []
             # Clear stale open-time / preview FPS so HUD cannot look "live" at
             # ~59 while Record is actually starved (v26 false confidence).
-            try:
+            with contextlib.suppress(AttributeError):
                 self.source.actual_fps = 0.0
-            except Exception:  # noqa: BLE001
-                pass
             reset = getattr(self.source, "reset_sequence", None)
             if callable(reset):
                 reset()
@@ -306,10 +301,10 @@ class CameraHandler:
     def live_delivery_fps(self) -> float:
         """Recent source.read() rate (true capture, not UI paint)."""
         stamps = list(self._delivery_ts)
-        if len(stamps) < 15:
+        if len(stamps) < settings.live_fps_min_samples:
             return 0.0
         elapsed = stamps[-1] - stamps[0]
-        if elapsed <= 0.1:
+        if elapsed <= settings.live_fps_min_window_s:
             return 0.0
         return (len(stamps) - 1) / elapsed
 
@@ -325,15 +320,13 @@ class CameraHandler:
     def _note_delivery(self) -> None:
         now = time.time()
         self._delivery_ts.append(now)
-        if len(self._delivery_ts) > 180:
+        if len(self._delivery_ts) > settings.live_fps_history:
             self._delivery_ts = self._delivery_ts[-180:]
         live = self.live_delivery_fps()
         if live < settings.min_live_fps:
             return
-        try:
+        with contextlib.suppress(AttributeError):
             self.source.actual_fps = live
-        except Exception:  # noqa: BLE001
-            pass
 
     def _loop(self) -> None:
         while self._running.is_set():

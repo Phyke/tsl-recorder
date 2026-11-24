@@ -8,7 +8,6 @@ This stage owns the VideoWriter encode (H.264 when available, else mp4v).
 Raw ~0.75GB/s frames are compressed here; the recorder only accounts
 encoded units and may remux FPS metadata after stop.
 """
-from __future__ import annotations
 
 import logging
 import threading
@@ -40,7 +39,7 @@ class Processor:
     out_queue_size: int = 512
 
     def __post_init__(self) -> None:
-        self.out_queue = DropCountingQueue(
+        self.out_queue: DropCountingQueue[EncodedEnvelope] = DropCountingQueue(
             self.out_queue_size, drop_oldest=False, name="recorder_in"
         )
         self._thread: threading.Thread | None = None
@@ -79,7 +78,8 @@ class Processor:
 
     def start(self) -> None:
         if self.output_path is None:
-            raise RuntimeError("Processor.configure_output() required before start()")
+            msg = "Processor.configure_output() required before start()"
+            raise RuntimeError(msg)
         if self._thread is not None and self._thread.is_alive():
             self.stop()
 
@@ -101,10 +101,11 @@ class Processor:
                 str(self.output_path), fourcc, float(self.fps), (self.width, self.height)
             )
         if not self._writer.isOpened():
-            raise RuntimeError(
+            msg = (
                 f"Processor VideoWriter failed for {self.output_path} "
                 f"fourcc={self.chosen_fourcc}"
             )
+            raise RuntimeError(msg)
         logger.info(
             "Processor encoding -> %s (%dx%d@%d) codec=%s",
             self.output_path, self.width, self.height, self.fps, self.codec_label,
@@ -161,7 +162,7 @@ class Processor:
         with self._encode_lock:
             if self._writer is None:
                 return
-            frame = ensure_bgr(env.frame, self.height, self.width)
+            frame = ensure_bgr(env.frame)
             h, w = frame.shape[:2]
             if w != self.width or h != self.height:
                 frame = cv2.resize(frame, (self.width, self.height))

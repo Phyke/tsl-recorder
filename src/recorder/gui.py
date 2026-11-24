@@ -5,13 +5,11 @@ Launch:
   uv run recorder
   uv run python -m recorder
 """
-from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
-import os
-import subprocess
 import sys
 import threading
 from collections.abc import Callable
@@ -19,8 +17,8 @@ from pathlib import Path
 
 import numpy as np
 from pydantic import ValidationError
-from PySide6.QtCore import QEvent, QLocale, QObject, Qt, QTimer
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QEvent, QLocale, QObject, Qt, QTimer, QUrl
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -42,10 +40,11 @@ from PySide6.QtWidgets import (
 )
 
 from recorder import ui_bridge
+from recorder.bag_recorder import BUILD_ID
 from recorder.cards import CameraCard
 from recorder.config import load_settings, save_settings, settings
 from recorder.devices import (
-    PreviewOpenCancelled,
+    PreviewOpenCancelledError,
     clear_preview_cancel,
     is_fhd_high_rate,
     request_preview_cancel,
@@ -55,7 +54,7 @@ from recorder.library import LibraryPage
 from recorder.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud
 from recorder.quiet import configure_app_logging, silence_opencv
 from recorder.review import show_review_prompt
-from recorder.session import MultiCamSession
+from recorder.session import CameraSlot, MultiCamSession
 from recorder.theme import (
     ACCENT,
     ACCENT_SOFT,
@@ -87,6 +86,7 @@ from recorder.user_messages import (
     no_frames_captured_message,
     preview_failed_message,
 )
+from recorder.win_names import ffmpeg_available
 
 configure_app_logging()
 logger = logging.getLogger("poc1.app")
@@ -130,13 +130,13 @@ class _WheelFilter(QObject):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if event.type() != QEvent.Type.Wheel or not isinstance(watched, QWidget):
             return False
-        return self.app._on_mousewheel(watched, event)
+        return self.app.on_mousewheel(watched, event)
 
 
 class UnifiedApp:
     """One comfortable shell over the existing multi-cam + library pipelines."""
 
-    def __init__(self, root: AppWindow, n_slots: int = 2, out_dir: Path | None = None, settings_path: Path | None = None):
+    def __init__(self, root: AppWindow, n_slots: int = 2, out_dir: Path | None = None, settings_path: Path | None = None) -> None:
         self.root = root
         # With no settings_path (a test run), no change is saved. main() loads the file into settings before this.
         self.settings_path = settings_path
@@ -151,8 +151,6 @@ class UnifiedApp:
         self.last_reports: dict[str, dict] = {}
         self._closing = False
         self._record_tiles: list[QLabel] = []
-
-        from recorder.bag_recorder import BUILD_ID
 
         root.setWindowTitle(f"POC1 Recorder — {BUILD_ID}")
         root.resize(1240, 860)
@@ -181,8 +179,6 @@ class UnifiedApp:
     # ── chrome ───────────────────────────────────────────────────────────
 
     def _build_chrome(self) -> None:
-        from recorder.bag_recorder import BUILD_ID
-
         header, row = frame(None, PANEL, border=True, padx=20, pady=14, kind="h")
         self._shell.addWidget(header)
         row.addWidget(label(header, "POC1 Recorder", fg=INK, font_spec=("Segoe UI Semibold", 18)))
@@ -306,7 +302,7 @@ class UnifiedApp:
         set_font_size(QApplication.instance(), size)
         self._save_setting("font_size", size)
 
-    def _save_setting(self, key: str, value) -> None:
+    def _save_setting(self, key: str, value: int | str) -> None:
         setattr(settings, key, value)
         if self.settings_path is not None:
             save_settings(self.settings_path)
@@ -469,7 +465,7 @@ class UnifiedApp:
         if path is not None:
             self.library.select_path(Path(path))
 
-    def _on_tab(self, *_args) -> None:
+    def _on_tab(self) -> None:
         current = self.notebook.currentWidget()
         if current is self.library_page:
             self.library.sync_folder(Path(self.out_entry.text()))
@@ -477,7 +473,7 @@ class UnifiedApp:
             self.refresh_record_gate()
             self._rebuild_record_tiles()
 
-    def _on_mousewheel(self, watched: QWidget, event) -> bool:
+    def on_mousewheel(self, watched: QWidget, event: QWheelEvent) -> bool:
         if self._closing or watched.window() is not self.root:
             return False
         if self.notebook.currentWidget() is not self.setup_page:
@@ -491,7 +487,7 @@ class UnifiedApp:
 
     # ── setup actions ────────────────────────────────────────────────────
 
-    def rebuild_cards(self, auto_assign: bool = False) -> None:
+    def rebuild_cards(self, *, auto_assign: bool = False) -> None:
         for card in self.cards:
             self.cards_grid.removeWidget(card)
             card.setParent(None)
@@ -531,14 +527,14 @@ class UnifiedApp:
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self.root, "Remove camera", str(exc))
 
-    def refresh_cameras(self, initial: bool = False) -> None:
+    def refresh_cameras(self, *, initial: bool = False) -> None:
         if self.busy:
             return
         if self.session.previews_running:
             if not _ask_yes_no(self.root, "Refresh cameras", "This stops all previews. Continue?"):
                 return
             self.session.stop_previews()
-        self._set_busy(True)
+        self._set_busy(busy=True)
         self.set_status("Scanning cameras… (UI stays responsive)")
 
         def worker() -> None:
@@ -551,16 +547,16 @@ class UnifiedApp:
                 error = str(exc)
             call_in_ui(
                 lambda d=devices, err=error, init=initial: self._refresh_cameras_done(
-                    d, err, init
+                    d, err, initial=init
                 )
             )
 
         threading.Thread(target=worker, name="app-refresh-cameras", daemon=True).start()
 
     def _refresh_cameras_done(
-        self, devices: list, error: str | None, initial: bool
+        self, devices: list, error: str | None, *, initial: bool
     ) -> None:
-        self._set_busy(False)
+        self._set_busy(busy=False)
         if error:
             QMessageBox.critical(self.root, "Camera scan failed", error)
             return
@@ -575,11 +571,11 @@ class UnifiedApp:
         )
         parts = []
         if rs_n:
-            parts.append(f"RealSense×{rs_n}")
+            parts.append(f"RealSense x{rs_n}")
         if elg_n:
-            parts.append(f"Elgato×{elg_n}")
+            parts.append(f"Elgato x{elg_n}")
         if uvc_n:
-            parts.append(f"UVC×{uvc_n}")
+            parts.append(f"UVC x{uvc_n}")
         summary = ", ".join(parts) or "none yet"
         names = ", ".join(d.name for d in real[:4]) or "none yet"
         status = (
@@ -588,15 +584,13 @@ class UnifiedApp:
         )
         if elg_n and sys.platform == "win32":
             try:
-                from recorder.win_names import ffmpeg_available
-
                 if not ffmpeg_available():
                     status += (
                         " Warning: ffmpeg missing — Elgato open may fail; "
                         "install ffmpeg on PATH, then Refresh."
                     )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                logger.debug("Could not check for ffmpeg", exc_info=True)
         self.set_status(status)
 
     def _clear_opening_placeholders(self) -> None:
@@ -606,7 +600,8 @@ class UnifiedApp:
                 continue
             try:
                 text = str(card.preview.text() or "")
-            except Exception:  # noqa: BLE001
+            except Exception:
+                logger.debug("Could not read the preview text of camera slot %s", card.slot_id, exc_info=True)
                 continue
             if "Opening" in text:
                 show_text(card.preview, "Start preview to see live video")
@@ -638,7 +633,7 @@ class UnifiedApp:
             return
         self._sync_all()
         clear_preview_cancel()
-        self._set_busy(True)
+        self._set_busy(busy=True)
         self.set_status("Opening cameras… (UI stays responsive)")
         for card in self.cards:
             if self.session.slots[card.slot_id].pipeline is None:
@@ -649,7 +644,7 @@ class UnifiedApp:
             cancelled = False
             try:
                 self.session.start_previews()
-            except PreviewOpenCancelled:
+            except PreviewOpenCancelledError:
                 cancelled = True
             except Exception as exc:
                 logger.exception("start_previews failed")
@@ -672,22 +667,20 @@ class UnifiedApp:
             return
         try:
             self.cards[slot_id].sync_controls()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            logger.debug("Could not sync the controls of camera slot %s", slot_id, exc_info=True)
         clear_preview_cancel()
-        self._set_busy(True)
+        self._set_busy(busy=True)
         self.set_status(f"Opening camera {slot_id + 1}…")
-        try:
+        with contextlib.suppress(RuntimeError):
             show_text(self.cards[slot_id].preview, "Opening camera…")
-        except Exception:  # noqa: BLE001
-            pass
 
         def worker() -> None:
             error: str | None = None
             cancelled = False
             try:
                 self.session.start_slot_preview(slot_id)
-            except PreviewOpenCancelled:
+            except PreviewOpenCancelledError:
                 cancelled = True
             except Exception as exc:
                 logger.exception("start_slot_preview failed")
@@ -707,8 +700,8 @@ class UnifiedApp:
             target=worker, name=f"app-preview-slot{slot_id}", daemon=True
         ).start()
 
-    def _previews_started(self, error: str | None, cancelled: bool = False) -> None:
-        self._set_busy(False)
+    def _previews_started(self, error: str | None, *, cancelled: bool = False) -> None:
+        self._set_busy(busy=False)
         clear_preview_cancel()
         self._clear_opening_placeholders()
         if cancelled:
@@ -721,8 +714,8 @@ class UnifiedApp:
         for card in self.cards:
             try:
                 card.sync_opened_mode_from_source()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                logger.debug("Could not sync the opened mode of camera slot %s", card.slot_id, exc_info=True)
         live = self._live_preview_count()
         opened = len([s for s in self.session.slots if s.pipeline])
         waiting = opened - live
@@ -746,16 +739,14 @@ class UnifiedApp:
         self.refresh_record_gate()
 
     def _slot_preview_started(
-        self, slot_id: int, error: str | None, cancelled: bool = False
+        self, slot_id: int, error: str | None, *, cancelled: bool = False
     ) -> None:
-        self._set_busy(False)
+        self._set_busy(busy=False)
         clear_preview_cancel()
         self._clear_opening_placeholders()
         if cancelled:
-            try:
+            with contextlib.suppress(RuntimeError):
                 show_text(self.cards[slot_id].preview, "Preview stopped")
-            except Exception:  # noqa: BLE001
-                pass
             self.set_status(f"Camera {slot_id + 1} open cancelled.")
             self.refresh_record_gate()
             return
@@ -766,13 +757,13 @@ class UnifiedApp:
             QMessageBox.critical(
                 self.root,
                 f"Camera {slot_id + 1}",
-                preview_failed_message(slot_id, error, device_tag=tag),
+                preview_failed_message(error, device_tag=tag),
             )
         else:
             try:
                 self.cards[slot_id].sync_opened_mode_from_source()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                logger.debug("Could not sync the opened mode of camera slot %s", slot_id, exc_info=True)
             self.set_status(f"Camera {slot_id + 1} is live.")
             QTimer.singleShot(3500, self.root, lambda: self._warn_slot_if_no_frames(slot_id))
         self.refresh_record_gate()
@@ -930,7 +921,7 @@ class UnifiedApp:
                 continue
             tw = tile.width()
             th = tile.height()
-            if tw < 40 or th < 40:
+            if tw < settings.min_tile_px or th < settings.min_tile_px:
                 continue
             src = slot.pipeline.source if slot.pipeline else None
             depth = slot.get_depth_preview_frame()
@@ -954,10 +945,10 @@ class UnifiedApp:
 
     # ── recording ────────────────────────────────────────────────────────
 
-    def _set_busy(self, busy: bool, recording: bool = False) -> None:
+    def _set_busy(self, *, busy: bool, recording: bool = False) -> None:
         self.busy = busy
         for card in self.cards:
-            card.set_locked(busy or recording)
+            card.set_locked(locked=busy or recording)
             # After unlock, force checkbox to match slot intent (never silently uncheck).
             if not busy and not recording:
                 card.restore_bag_checkbox()
@@ -1041,12 +1032,12 @@ class UnifiedApp:
             for s in armed
             if s.mode and s.mode.width * s.mode.height * s.mode.fps >= 1920 * 1080 * 60
         ]
-        if len(armed) >= 2 and heavy:
+        if len(armed) >= 2 and heavy:  # noqa: PLR2004
             self.set_status(
                 "High-rate multi-cam — encode will finish every queued frame on Stop."
             )
 
-        self._set_busy(True)
+        self._set_busy(busy=True)
         # Re-apply after lock so nothing in set_locked can drop the flag.
         for s in self.session.slots:
             s.record_bag = bag_intent.get(s.slot_id, False)
@@ -1066,13 +1057,13 @@ class UnifiedApp:
 
     def _record_started(self, paths: list[Path], error: str | None) -> None:
         if error:
-            self._set_busy(False)
+            self._set_busy(busy=False)
             for card in self.cards:
                 card.restore_bag_checkbox()
             self.set_status("Recording did not start.")
             QMessageBox.critical(self.root, "Recording", error)
             return
-        self._set_busy(False, recording=True)
+        self._set_busy(busy=False, recording=True)
         n = max(1, len(paths))
         extra = self._elgato_live_lines()
         tip = f"Recording {n} camera(s)…"
@@ -1107,12 +1098,12 @@ class UnifiedApp:
             return
         if not self.session.is_recording:
             if self.busy:
-                self._set_busy(False)
+                self._set_busy(busy=False)
             self.set_status("Not recording.")
             return
 
         self._stopping = True
-        self._set_busy(True, recording=True)
+        self._set_busy(busy=True, recording=True)
         self._set_record_tip("Stopping… saving files (please wait a moment).")
         self.set_status("Stopping recording…")
 
@@ -1133,7 +1124,7 @@ class UnifiedApp:
     ) -> None:
         self._stopping = False
         self.last_reports = reports
-        self._set_busy(False)
+        self._set_busy(busy=False)
         for card in self.cards:
             card.restore_bag_checkbox()
         if error:
@@ -1187,7 +1178,7 @@ class UnifiedApp:
         if bag_drops:
             status += (
                 " Elgato ROS2 bag queue dropped frames: "
-                + ", ".join(f"{p}×{n}" for p, n in bag_drops)
+                + ", ".join(f"{p} x{n}" for p, n in bag_drops)
                 + " (MP4 path separate)."
             )
         self.set_status(status)
@@ -1220,8 +1211,6 @@ class UnifiedApp:
                 f"Camera {slot.slot_id + 1} · prefix={slot.prefix!r} · {cam_label}"
             )
         if no_capture:
-            from recorder.bag_recorder import BUILD_ID
-
             QMessageBox.critical(
                 self.root,
                 "No frames captured",
@@ -1297,8 +1286,8 @@ class UnifiedApp:
                 review_label="Open in Library",
             )
 
-    def _convert_mismatched_async(self, mismatched) -> None:
-        self._set_busy(True)
+    def _convert_mismatched_async(self, mismatched: list[tuple[CameraSlot, dict]]) -> None:
+        self._set_busy(busy=True)
         self.set_status("Fixing playback speed in the background…")
 
         def worker() -> None:
@@ -1317,14 +1306,14 @@ class UnifiedApp:
 
     def _conversion_done(self, results: dict[str, bool]) -> None:
         for slot in self.session.slots:
-            if slot.pipeline and slot.pipeline._last_report:
-                self.last_reports[slot.prefix] = slot.pipeline._last_report
-        self._set_busy(False)
+            if slot.pipeline and slot.pipeline.last_report:
+                self.last_reports[slot.prefix] = slot.pipeline.last_report
+        self._set_busy(busy=False)
         failed = [prefix for prefix, ok in results.items() if not ok]
         if failed:
             QMessageBox.warning(
                 self.root,
-                "Couldn’t fix all files",
+                "Couldn't fix all files",
                 "Still using original timing for: " + ", ".join(failed),
             )
         else:
@@ -1341,7 +1330,7 @@ class UnifiedApp:
         popup.resize(720, 520)
         popup.setObjectName("reportPopup")
         popup.setStyleSheet(f"QDialog#reportPopup {{ background: {BG}; }}")
-        popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, on=True)
         popup.setModal(False)
         column = QVBoxLayout(popup)
         column.setContentsMargins(10, 10, 10, 8)
@@ -1408,12 +1397,8 @@ class UnifiedApp:
         path = Path(self.out_entry.text()).expanduser().resolve()
         path.mkdir(parents=True, exist_ok=True)
         try:
-            if sys.platform == "win32":
-                os.startfile(path)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(path)])
-            else:
-                subprocess.Popen(["xdg-open", str(path)])
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+                QMessageBox.critical(self.root, "Open folder", f"Could not open {path}")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self.root, "Open folder", str(exc))
 
@@ -1463,16 +1448,14 @@ class UnifiedApp:
         self._closing = True
         try:
             self.library.stop_playback()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            logger.debug("Could not stop the library playback", exc_info=True)
         try:
             self.session.shutdown()
         except Exception:
             logger.exception("shutdown failed")
-        try:
+        with contextlib.suppress(AttributeError, RuntimeError):
             QApplication.instance().removeEventFilter(self._wheel_filter)
-        except Exception:  # noqa: BLE001
-            pass
         return True
 
 

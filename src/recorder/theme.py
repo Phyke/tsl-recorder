@@ -1,12 +1,12 @@
 """Shared visual language for the unified POC1 app."""
-from __future__ import annotations
 
 import itertools
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QImage, QPalette, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QPalette, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,9 +41,15 @@ FIELD = "#ffffff"
 # The Windows gray text color, which a disabled Tk Checkbutton uses.
 DISABLED_TEXT = "#6d6d6d"
 
+
 # The size of the base text in points, as the widgets use it now (poc1 uses Segoe UI 9, settings.base_font_size).
 # The Settings tab changes it, and each font follows in proportion.
-_font_size = settings.font_size
+@dataclass
+class _ThemeState:
+    font_size: int
+
+
+_state = _ThemeState(font_size=settings.font_size)
 
 _names = itertools.count(1)
 
@@ -54,8 +60,8 @@ def apply_styles(app: QApplication) -> None:
     app.setStyle("Fusion")
     app.setFont(font(("Segoe UI", settings.base_font_size)))
     # A message box uses the base text size, so it follows the Interface font size.
-    message_font = f'font-family: "Segoe UI"; font-size: {_font_size}pt;'
-    tab_size = 10 * _font_size / settings.base_font_size
+    message_font = f'font-family: "Segoe UI"; font-size: {_state.font_size}pt;'
+    tab_size = 10 * _state.font_size / settings.base_font_size
     app.setStyleSheet(
         f"""
         QComboBox {{ background: {FIELD}; color: {INK}; border: 1px solid {BORDER}; padding: 3px 6px; }}
@@ -76,7 +82,7 @@ def apply_styles(app: QApplication) -> None:
 
 def _sized_font(family: str, size: int) -> QFont:
     result = QFont(family)
-    result.setPointSizeF(size * _font_size / settings.base_font_size)
+    result.setPointSizeF(size * _state.font_size / settings.base_font_size)
     return result
 
 
@@ -85,20 +91,19 @@ def font(spec: tuple) -> QFont:
 
 
 def font_size() -> int:
-    return _font_size
+    return _state.font_size
 
 
 # A new font size applies at once: the app font and the styles, each widget with a font of its own, and each text size.
 def set_font_size(app: QApplication, size: int) -> None:
-    global _font_size
-    old_scale = _font_size / settings.base_font_size
+    old_scale = _state.font_size / settings.base_font_size
     widgets = app.allWidgets()
     own_font = [w for w in widgets if w.testAttribute(Qt.WidgetAttribute.WA_SetFont) and w.font().pointSizeF() > 0]
     # Each size at the base font size, kept before any font changes, because Qt copies some fonts (a combo box to its list) on a change.
     for widget in own_font:
         if widget.property("unscaled_point_size") is None:
             widget.setProperty("unscaled_point_size", widget.font().pointSizeF() / old_scale)
-    _font_size = size
+    _state.font_size = size
     for widget in own_font:
         widget_font = widget.font()
         widget_font.setPointSizeF(widget.property("unscaled_point_size") * size / settings.base_font_size)
@@ -187,13 +192,13 @@ def set_label_colors(widget: QLabel, fg: str, bg: str | None = None, *, padx: in
 def style_check_box(box: QCheckBox) -> None:
     box.setStyleSheet(f"QCheckBox {{ color: {INK}; }} QCheckBox:disabled {{ color: {DISABLED_TEXT}; }}")
 
-    def fill(checked: bool) -> None:
+    def fill(*, checked: bool) -> None:
         palette = box.palette()
         palette.setColor(QPalette.ColorRole.Base, QColor(ACCENT_SOFT if checked else FIELD))
         box.setPalette(palette)
 
-    box.toggled.connect(fill)
-    fill(box.isChecked())
+    box.toggled.connect(lambda checked: fill(checked=checked))
+    fill(checked=box.isChecked())
 
 
 def button(
@@ -230,7 +235,7 @@ class NoWheelComboBox(QComboBox):
         self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.setMinimumContentsLength(20)
 
-    def wheelEvent(self, event) -> None:  # noqa: N802
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
         event.ignore()
 
     # The list takes the font of the combo box each time it opens. A list can lose its own font when a window

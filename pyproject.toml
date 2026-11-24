@@ -3,7 +3,7 @@ name = "tsl-recorder"
 version = "0.1.0"
 description = "TSL recorder: the poc1 Setup / Record / Library app (realsense-recorder 93df15b) in PySide6"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = [
     "opencv-python>=5.0.0.93",
     "numpy>=1.26.0",
@@ -54,4 +54,4 @@ line-length = 144
 
 [tool.ruff.lint]
 select = ["ALL"]
-ignore = ["COM812", "CPY001", "D"]
+ignore = ["COM812", "CPY001", "D", "SIM108", "TC", "TRY300"]

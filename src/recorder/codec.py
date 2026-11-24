@@ -2,8 +2,8 @@
 Pick a working OpenCV VideoWriter fourcc. Result is cached so Record starts fast
 and we never probe broken H.264 paths that spam the console.
 """
-from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -23,9 +23,7 @@ logger = logging.getLogger("poc1.codec")
 def _openh264_present() -> bool:
     names = ("openh264-2.5.0-win64.dll", "openh264-2.4.1-win64.dll", "openh264-1.8.0-win64.dll")
     search = [Path.cwd()]
-    for base in (Path(sys.prefix), Path(sys.prefix) / "Scripts"):
-        if base.is_dir():
-            search.append(base)
+    search.extend(base for base in (Path(sys.prefix), Path(sys.prefix) / "Scripts") if base.is_dir())
     for p in os.environ.get("PATH", "").split(os.pathsep):
         if not p:
             continue
@@ -65,13 +63,11 @@ def _probe_fourcc(fourcc_str: str, width: int = 64, height: int = 64, fps: int =
                 ok, _ = cap.read()
             cap.release()
             return bool(ok)
-        except Exception:
+        except (cv2.error, OSError):
             return False
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 @lru_cache(maxsize=1)

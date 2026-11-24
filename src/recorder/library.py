@@ -1,15 +1,13 @@
-"""Library page — browse, play, export (R9–R10)."""
-from __future__ import annotations
+"""Library page — browse, play, export (R9-R10)."""
 
-import os
-import subprocess
-import sys
+import logging
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cv2
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -24,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from recorder.config import settings
 from recorder.device_enum import quiet_opencv
-from recorder.export import export_to_mp4, list_media_files
+from recorder.export import ExportResult, _find_ffmpeg, export_to_mp4, list_media_files
 from recorder.theme import (
     ACCENT,
     BG,
@@ -53,6 +51,8 @@ from recorder.ui_bridge import call_in_ui
 if TYPE_CHECKING:
     from recorder.gui import UnifiedApp
 
+logger = logging.getLogger("poc1.library")
+
 
 def _ask_yes_no(parent: QWidget, title: str, text: str) -> bool:
     answer = QMessageBox.question(
@@ -62,7 +62,7 @@ def _ask_yes_no(parent: QWidget, title: str, text: str) -> bool:
 
 
 class LibraryPage(QFrame):
-    def __init__(self, master: QWidget, app: UnifiedApp):
+    def __init__(self, master: QWidget, app: UnifiedApp) -> None:
         super().__init__(master)
         self.setObjectName("libraryPage")
         self.setStyleSheet(f"QFrame#libraryPage {{ background: {BG}; }}")
@@ -205,14 +205,12 @@ class LibraryPage(QFrame):
         self.folder_entry.setText(str(Path(folder).resolve()))
         self.refresh_list()
         try:
-            from recorder.export import _find_ffmpeg
-
             if _find_ffmpeg() is None:
                 self._set_export_status(
                     "Note: ffmpeg not on PATH — install it for export fallbacks / Elgato names."
                 )
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            logger.debug("Could not check for ffmpeg", exc_info=True)
 
     def browse_folder(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self.window(), "", self.folder_entry.text() or ".")
@@ -223,7 +221,7 @@ class LibraryPage(QFrame):
     def refresh_list(self) -> None:
         folder = Path(self.folder_entry.text() or ".")
         self.files = list_media_files(folder)
-        blocked = self.listbox.blockSignals(True)
+        blocked = self.listbox.blockSignals(True)  # noqa: FBT003
         self.listbox.clear()
         for path in self.files:
             self.listbox.addItem(self._display_name(path))
@@ -260,7 +258,7 @@ class LibraryPage(QFrame):
             except ValueError:
                 return
         # A Tk selection_set does not send <<ListboxSelect>>.
-        blocked = self.listbox.blockSignals(True)
+        blocked = self.listbox.blockSignals(True)  # noqa: FBT003
         self.listbox.clearSelection()
         self.listbox.setCurrentRow(idx)
         self.listbox.blockSignals(blocked)
@@ -270,7 +268,7 @@ class LibraryPage(QFrame):
         if path.suffix.lower() in {".mp4", ".avi", ".mkv"}:
             self.play_selected()
 
-    def _on_select(self, *_args) -> None:
+    def _on_select(self) -> None:
         idx = self._current_index()
         if idx is None:
             return
@@ -364,12 +362,8 @@ class LibraryPage(QFrame):
             QMessageBox.information(self.window(), "System player", "Open an MP4 (export bags first if needed).")
             return
         try:
-            if sys.platform == "win32":
-                os.startfile(path)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(path)])
-            else:
-                subprocess.Popen(["xdg-open", str(path)])
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+                QMessageBox.critical(self.window(), "System player", f"Could not open {path}")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self.window(), "System player", str(exc))
 
@@ -461,7 +455,7 @@ class LibraryPage(QFrame):
 
         threading.Thread(target=worker, name="app-export", daemon=True).start()
 
-    def _export_done(self, result) -> None:
+    def _export_done(self, result: ExportResult) -> None:
         self._busy = False
         if not result.ok:
             self._set_export_status(result.message, "#b91c1c")
@@ -469,6 +463,6 @@ class LibraryPage(QFrame):
             return
         self._set_export_status(f"{result.message}  ({result.codec_label})", GREEN)
         self.refresh_list()
-        if result.output_path and result.output_path.is_file():
+        if result.output_path and result.output_path.is_file():  # noqa: SIM102
             if _ask_yes_no(self.window(), "Export complete", "Play the new MP4 now?"):
                 self.select_path(result.output_path)

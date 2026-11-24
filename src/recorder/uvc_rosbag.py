@@ -1,6 +1,6 @@
 """ROS2 color bag for Elgato/UVC (not Intel RealSense SDK .bag)."""
-from __future__ import annotations
 
+import contextlib
 import logging
 import queue
 import shutil
@@ -66,10 +66,8 @@ class UvcRos2Bag:
             self._q.put(None, timeout=5.0)
         except queue.Full:
             logger.warning("ROS2 bag queue full at stop — forcing sentinel")
-            try:
+            with contextlib.suppress(queue.Empty):
                 self._q.get_nowait()
-            except queue.Empty:
-                pass
             self._q.put_nowait(None)
         if self._thread:
             self._thread.join(timeout=45.0)
@@ -94,14 +92,14 @@ class UvcRos2Bag:
             from rosbags.typesys import Stores, get_typestore
 
             typestore = get_typestore(Stores.LATEST)
-            Compressed = typestore.types["sensor_msgs/msg/CompressedImage"]
-            Header = typestore.types["std_msgs/msg/Header"]
-            Time = typestore.types["builtin_interfaces/msg/Time"]
+            CompressedImage = typestore.types["sensor_msgs/msg/CompressedImage"]  # noqa: N806
+            Header = typestore.types["std_msgs/msg/Header"]  # noqa: N806
+            Time = typestore.types["builtin_interfaces/msg/Time"]  # noqa: N806
             writer = Writer(self.path, version=Writer.VERSION_LATEST)
             writer.open()
             conn = writer.add_connection(
                 "/camera/color/image_raw/compressed",
-                Compressed.__msgtype__,
+                CompressedImage.__msgtype__,
                 typestore=typestore,
             )
             self._ready.set()
@@ -112,7 +110,7 @@ class UvcRos2Bag:
                 jpeg, ns = item
                 sec = ns // 1_000_000_000
                 nsec = ns % 1_000_000_000
-                msg = Compressed(
+                msg = CompressedImage(
                     header=Header(
                         stamp=Time(sec=int(sec), nanosec=int(nsec)),
                         frame_id="elgato",
@@ -120,7 +118,7 @@ class UvcRos2Bag:
                     format="jpeg",
                     data=np.frombuffer(jpeg, dtype=np.uint8),
                 )
-                cdr = typestore.serialize_cdr(msg, Compressed.__msgtype__)
+                cdr = typestore.serialize_cdr(msg, CompressedImage.__msgtype__)
                 writer.write(conn, ns, cdr)
                 self.frames_written += 1
         except Exception as exc:
@@ -131,5 +129,5 @@ class UvcRos2Bag:
             if writer is not None:
                 try:
                     writer.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not close the bag writer", exc_info=True)

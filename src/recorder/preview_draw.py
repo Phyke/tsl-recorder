@@ -1,23 +1,29 @@
 """Live-preview scaling: fill the widget (cover-crop) without blocking Record."""
-from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 
 from recorder.config import settings
 from recorder.frame_layout import PIPE_NV12, ensure_bgr
+from recorder.user_messages import capture_not_120_hud_hint
+
+if TYPE_CHECKING:
+    from recorder.frame_source import FrameSource
+    from recorder.session import CameraSlot
 
 
 def colorize_depth_preview(raw: np.ndarray) -> np.ndarray:
     """Jet preview of a uint16 depth buffer. Not used on the capture thread."""
-    if raw.ndim != 2:
+    if raw.ndim != 2:  # noqa: PLR2004
         return ensure_bgr(raw)
     vis = cv2.convertScaleAbs(raw, alpha=255.0 / 4000.0)
     return cv2.applyColorMap(vis, cv2.COLORMAP_JET)
 
 
 def downscale_for_preview(frame: np.ndarray, max_width: int = settings.preview_max_width) -> np.ndarray:
-    bgr = ensure_bgr(frame, 0, 0)
+    bgr = ensure_bgr(frame)
     h, w = bgr.shape[:2]
     if w <= max_width:
         return bgr.copy()
@@ -35,8 +41,8 @@ def fill_bgr(bgr: np.ndarray, dest_w: int, dest_h: int) -> np.ndarray:
     if w < 1 or h < 1:
         return np.zeros((dest_h, dest_w, 3), dtype=np.uint8)
     scale = max(dest_w / float(w), dest_h / float(h))
-    nw = max(1, int(round(w * scale)))
-    nh = max(1, int(round(h * scale)))
+    nw = max(1, round(w * scale))
+    nh = max(1, round(h * scale))
     resized = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
     x0 = max(0, (nw - dest_w) // 2)
     y0 = max(0, (nh - dest_h) // 2)
@@ -47,7 +53,7 @@ def fill_bgr(bgr: np.ndarray, dest_w: int, dest_h: int) -> np.ndarray:
 
 
 def bgr_to_rgb_fill(frame: np.ndarray, dest_w: int, dest_h: int) -> np.ndarray:
-    bgr = ensure_bgr(frame, 0, 0)
+    bgr = ensure_bgr(frame)
     return cv2.cvtColor(fill_bgr(bgr, dest_w, dest_h), cv2.COLOR_BGR2RGB)
 
 
@@ -66,7 +72,7 @@ def overlay_hud(rgb: np.ndarray, lines: list[str]) -> np.ndarray:
     return img
 
 
-def hud_lines_for_source(slot, src) -> list[str]:
+def hud_lines_for_source(slot: CameraSlot, src: FrameSource) -> list[str]:
     """Build overlay lines from a live slot + frame source."""
     cam = getattr(slot, "camera", None)
     kind = getattr(cam, "kind", "") if cam is not None else ""
@@ -93,7 +99,7 @@ def hud_lines_for_source(slot, src) -> list[str]:
     try:
         if slot.pipeline and slot.pipeline.camera_handler.is_recording:
             rec = "REC"
-    except Exception:
+    except AttributeError:
         rec = ""
     line1 = f"{tag}  {w}x{h}@{mode_fps}"
     if rec:
@@ -107,8 +113,6 @@ def hud_lines_for_source(slot, src) -> list[str]:
     if preview_fps > 1:
         lines.append(f"UI paint ~{preview_fps:.0f} fps (not file FPS)")
     if mode_fps >= settings.high_rate_fps and camera_fps < mode_fps * 0.85 and tag == "elgato":
-        from recorder.user_messages import capture_not_120_hud_hint
-
         lines.append(capture_not_120_hud_hint(camera_fps, mode_fps, stamped))
     elif kind == "realsense" and mode_fps >= settings.high_rate_fps:
         lines.append("D400 color is not 120fps")

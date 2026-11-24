@@ -5,16 +5,18 @@ R10 — export .bag / .bd3 / .db3 to MP4 (H.264 or H.265 when available).
 ROS2 .db3 / .bd3      → pure-Python ``rosbags`` (+ ``rosbags-image``) when Image topics exist
 fallbacks             → OpenCV, ffmpeg
 """
-from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -22,6 +24,9 @@ import numpy as np
 from recorder.codec import _probe_fourcc
 from recorder.config import settings
 from recorder.device_enum import quiet_opencv
+
+if TYPE_CHECKING:
+    from rosbags.interfaces import Connection
 
 logger = logging.getLogger("poc1.d2.export")
 
@@ -87,11 +92,10 @@ def list_media_files(folder: Path) -> list[Path]:
         p for p in sorted(folder.iterdir())
         if p.is_file() and p.suffix.lower() in exts
     ]
-    for p in sorted(folder.iterdir()):
-        if p.is_dir() and (
-            p.name.endswith("_color") or (p / "metadata.yaml").is_file()
-        ):
-            out.append(p)
+    out.extend(
+        p for p in sorted(folder.iterdir())
+        if p.is_dir() and (p.name.endswith("_color") or (p / "metadata.yaml").is_file())
+    )
     return out
 
 
@@ -105,7 +109,7 @@ def export_to_mp4(
     """Decode .bag / .bd3 / .db3 (or ROS2 folder) to a NEW MP4. Never overwrite Record MP4."""
     source = Path(source)
     if not source.exists():
-        return ExportResult(False, None, "", message=f"File not found: {source}")
+        return ExportResult(ok=False, output_path=None, codec_label="", message=f"File not found: {source}")
 
     ext = source.suffix.lower()
     codec_key = (codec or "h264").strip().lower()
@@ -198,7 +202,7 @@ def _sibling_record_mp4(source: Path) -> Path | None:
     return None
 
 
-def _start_realsense_playback(rs: Any, source: Path):
+def _start_realsense_playback(rs: ModuleType, source: Path) -> tuple[Any, Any]:
     """
     Open a RealSense .bag/.db3 for playback.
 
@@ -208,9 +212,10 @@ def _start_realsense_playback(rs: Any, source: Path):
     source_s = str(Path(source).resolve())
     last_exc: BaseException | None = None
 
-    strategies: list[tuple[str, Callable[[], Any]]] = []
+    # Not used (ruff F841), so it is commented out for now. The loop below lists the strategies.
+    # strategies: list[tuple[str, Callable[[], Any]]] = []  # noqa: ERA001
 
-    def _cfg_file_only():
+    def _cfg_file_only() -> tuple[Any, Any]:
         pipeline = rs.pipeline()
         config = rs.config()
         try:
@@ -219,7 +224,7 @@ def _start_realsense_playback(rs: Any, source: Path):
             rs.config.enable_device_from_file(config, source_s)
         return pipeline, pipeline.start(config)
 
-    def _cfg_color():
+    def _cfg_color() -> tuple[Any, Any]:
         pipeline = rs.pipeline()
         config = rs.config()
         try:
@@ -229,7 +234,7 @@ def _start_realsense_playback(rs: Any, source: Path):
         config.enable_stream(rs.stream.color)
         return pipeline, pipeline.start(config)
 
-    def _cfg_depth():
+    def _cfg_depth() -> tuple[Any, Any]:
         pipeline = rs.pipeline()
         config = rs.config()
         try:
@@ -239,24 +244,20 @@ def _start_realsense_playback(rs: Any, source: Path):
         config.enable_stream(rs.stream.depth)
         return pipeline, pipeline.start(config)
 
-    def _load_device():
+    def _load_device() -> tuple[Any, Any]:
         ctx = rs.context()
         device = ctx.load_device(source_s)
         pipeline = rs.pipeline()
         config = rs.config()
         # Bind to the loaded playback device by serial when available.
-        try:
+        with contextlib.suppress(RuntimeError):
             serial = device.get_info(rs.camera_info.serial_number)
             config.enable_device(serial)
-        except Exception:  # noqa: BLE001
-            pass
         try:
             rs.config.enable_device_from_file(config, source_s, repeat_playback=False)
         except TypeError:
-            try:
+            with contextlib.suppress(RuntimeError):
                 rs.config.enable_device_from_file(config, source_s)
-            except Exception:  # noqa: BLE001
-                pass
         return pipeline, pipeline.start(config)
 
     for name, fn in (
@@ -288,21 +289,21 @@ def _export_realsense_bag(
         import pyrealsense2 as rs
     except ImportError:
         return ExportResult(
-            False,
-            None,
-            label,
+            ok=False,
+            output_path=None,
+            codec_label=label,
             message="pyrealsense2 is required for RealSense .bag/.db3 export. "
             "Run: uv sync --extra realsense",
         )
 
     source = Path(source).resolve()
     if not source.is_file():
-        return ExportResult(False, None, label, message=f"File not found: {source}")
-    if source.stat().st_size < 64:
+        return ExportResult(ok=False, output_path=None, codec_label=label, message=f"File not found: {source}")
+    if source.stat().st_size < settings.min_bag_bytes:
         return ExportResult(
-            False,
-            None,
-            label,
+            ok=False,
+            output_path=None,
+            codec_label=label,
             message=f"{source.name} is empty/too small — re-Record with SDK file checked",
         )
 
@@ -311,9 +312,9 @@ def _export_realsense_bag(
         pipeline, profile = _start_realsense_playback(rs, source)
     except Exception as exc:  # noqa: BLE001
         return ExportResult(
-            False,
-            None,
-            label,
+            ok=False,
+            output_path=None,
+            codec_label=label,
             message=f"Could not open RealSense recording: {exc}",
         )
 
@@ -330,20 +331,25 @@ def _export_realsense_bag(
     width = height = 0
     fps = 30.0
 
-    def to_bgr(color_frame) -> np.ndarray | None:
+    fmt_warned = False
+
+    def to_bgr(color_frame: Any) -> np.ndarray | None:  # noqa: ANN401
+        nonlocal fmt_warned
         arr = np.asanyarray(color_frame.get_data())
         fmt = None
         try:
             fmt = color_frame.get_profile().format()
-        except Exception:  # noqa: BLE001
-            pass
-        if arr.ndim == 3 and arr.shape[2] == 3:
+        except RuntimeError:
+            if not fmt_warned:
+                logger.warning("Could not read the color format of %s; 3-channel frames are treated as RGB", source.name, exc_info=True)
+                fmt_warned = True
+        if arr.ndim == 3 and arr.shape[2] == 3:  # noqa: PLR2004
             if fmt == rs.format.bgr8:
                 return arr
             return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        if arr.ndim == 3 and arr.shape[2] == 2:
+        if arr.ndim == 3 and arr.shape[2] == 2:  # noqa: PLR2004
             return cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_YUY2)
-        if arr.ndim == 2:
+        if arr.ndim == 2:  # noqa: PLR2004
             if fmt == rs.format.yuyv:
                 return cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_YUY2)
             if arr.dtype == np.uint16:
@@ -369,7 +375,7 @@ def _export_realsense_bag(
                 frameset = pipeline.wait_for_frames(timeout_ms=5000)
             except RuntimeError:
                 idle += 1
-                if idle >= 4:
+                if idle >= settings.playback_idle_limit:
                     break
                 continue
             idle = 0
@@ -389,9 +395,9 @@ def _export_realsense_bag(
                 writer, used_fourcc = _open_writer(output, fourcc, fps, w, h)
                 if writer is None:
                     return ExportResult(
-                        False,
-                        None,
-                        label,
+                        ok=False,
+                        output_path=None,
+                        codec_label=label,
                         message=f"VideoWriter failed for {fourcc}/{w}x{h}",
                     )
                 progress(f"Writing {output.name} ({used_fourcc}) …")
@@ -403,24 +409,22 @@ def _export_realsense_bag(
             if frames_written % 60 == 0:
                 progress(f"Exported {frames_written} frames…")
     finally:
-        try:
+        with contextlib.suppress(RuntimeError):
             pipeline.stop()
-        except Exception:  # noqa: BLE001
-            pass
         if writer is not None:
             writer.release()
 
     if frames_written <= 0:
         output.unlink(missing_ok=True)
         return ExportResult(
-            False, None, label, message="Recording contained no exportable frames"
+            ok=False, output_path=None, codec_label=label, message="Recording contained no exportable frames"
         )
 
     final_label = label if used_fourcc == fourcc else f"{label} → {used_fourcc}"
     return ExportResult(
-        True,
-        output,
-        final_label,
+        ok=True,
+        output_path=output,
+        codec_label=final_label,
         frames=frames_written,
         message=f"Wrote {frames_written} frames → {output.name}",
     )
@@ -439,7 +443,7 @@ def _export_via_opencv(
     if not cap.isOpened():
         cap.release()
         return ExportResult(
-            False, None, label, message=f"OpenCV could not open {source.name}"
+            ok=False, output_path=None, codec_label=label, message=f"OpenCV could not open {source.name}"
         )
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0) or 30.0
@@ -448,7 +452,7 @@ def _export_via_opencv(
     writer, used_fourcc = _open_writer(output, fourcc, fps, max(width, 1), max(height, 1))
     if writer is None:
         cap.release()
-        return ExportResult(False, None, label, message="VideoWriter failed to open")
+        return ExportResult(ok=False, output_path=None, codec_label=label, message="VideoWriter failed to open")
 
     frames_written = 0
     try:
@@ -471,12 +475,12 @@ def _export_via_opencv(
 
     if frames_written <= 0:
         output.unlink(missing_ok=True)
-        return ExportResult(False, None, label, message="No frames decoded")
+        return ExportResult(ok=False, output_path=None, codec_label=label, message="No frames decoded")
 
     return ExportResult(
-        True,
-        output,
-        label if used_fourcc == fourcc else f"{label} → {used_fourcc}",
+        ok=True,
+        output_path=output,
+        codec_label=label if used_fourcc == fourcc else f"{label} → {used_fourcc}",
         frames=frames_written,
         message=f"Wrote {frames_written} frames → {output.name}",
     )
@@ -492,9 +496,9 @@ def _export_via_ffmpeg(
     ffmpeg = _find_ffmpeg()
     if not ffmpeg:
         return ExportResult(
-            False,
-            None,
-            label,
+            ok=False,
+            output_path=None,
+            codec_label=label,
             message="ffmpeg not found on PATH (install ffmpeg or add it to PATH)",
         )
     vcodec = "libx265" if codec.lower() in {"h265", "hevc", "h.265"} else "libx264"
@@ -515,16 +519,16 @@ def _export_via_ffmpeg(
         str(output),
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)  # noqa: S603
     except Exception as exc:  # noqa: BLE001
-        return ExportResult(False, None, label, message=str(exc))
+        return ExportResult(ok=False, output_path=None, codec_label=label, message=str(exc))
     if proc.returncode != 0 or not output.is_file() or output.stat().st_size < settings.min_file_bytes:
         err = (proc.stderr or proc.stdout or "ffmpeg failed").strip()
-        return ExportResult(False, None, label, message=err[:500])
+        return ExportResult(ok=False, output_path=None, codec_label=label, message=err[:500])
     return ExportResult(
-        True,
-        output,
-        f"{label} via ffmpeg/{vcodec}",
+        ok=True,
+        output_path=output,
+        codec_label=f"{label} via ffmpeg/{vcodec}",
         message=f"ffmpeg wrote {output.name}",
     )
 
@@ -549,8 +553,6 @@ def _find_ffmpeg() -> str | None:
 def _looks_like_ros2_db3(source: Path) -> bool:
     """Best-effort detect ROS2 sqlite3 bag without requiring rosbag2."""
     try:
-        import sqlite3
-
         conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
         try:
             cur = conn.execute(
@@ -623,7 +625,7 @@ def _resolve_rosbag_dir(source: Path) -> tuple[Path, tempfile.TemporaryDirectory
     return bag_dir, tmp
 
 
-def _pick_image_connections(connections) -> list:
+def _pick_image_connections(connections: list[Connection]) -> list:
     """Prefer color/image topics; fall back to any Image / CompressedImage."""
     image_conns = [
         c
@@ -635,7 +637,7 @@ def _pick_image_connections(connections) -> list:
     if not image_conns:
         return []
 
-    def score(conn) -> tuple:
+    def score(conn: Connection) -> tuple:
         topic = (conn.topic or "").lower()
         msg = (conn.msgtype or "").lower()
         prefer = 0
@@ -664,9 +666,9 @@ def _export_rosbag2_to_mp4(
         from rosbags.image import message_to_cvimage
     except ImportError:
         return ExportResult(
-            False,
-            None,
-            label,
+            ok=False,
+            output_path=None,
+            codec_label=label,
             message=(
                 "ROS bag support needs packages: rosbags + rosbags-image. "
                 "Run: uv sync"
@@ -676,9 +678,9 @@ def _export_rosbag2_to_mp4(
     # Skip obvious non-sqlite junk before creating temp bag folders.
     if source.is_file() and not _looks_like_ros2_db3(source):
         return ExportResult(
-            False,
-            None,
-            label,
+            ok=False,
+            output_path=None,
+            codec_label=label,
             message=f"{source.name} is not a ROS 2 sqlite bag (.db3)",
         )
 
@@ -692,9 +694,9 @@ def _export_rosbag2_to_mp4(
                     f"{c.topic} ({c.msgtype})" for c in list(reader.connections)[:12]
                 ) or "(none)"
                 return ExportResult(
-                    False,
-                    None,
-                    label,
+                    ok=False,
+                    output_path=None,
+                    codec_label=label,
                     message=(
                         f"No image topics in {source.name}.\n"
                         f"Topics found: {topics}\n"
@@ -724,9 +726,9 @@ def _export_rosbag2_to_mp4(
                     continue
                 if frame is None or not hasattr(frame, "shape"):
                     continue
-                if frame.ndim == 2:
+                if frame.ndim == 2:  # noqa: PLR2004
                     frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                elif frame.shape[2] == 4:
+                elif frame.shape[2] == 4:  # noqa: PLR2004
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
                 h, w = frame.shape[:2]
@@ -737,9 +739,9 @@ def _export_rosbag2_to_mp4(
                     writer, used_fourcc = _open_writer(output, fourcc, 30.0, w, h)
                     if writer is None:
                         return ExportResult(
-                            False,
-                            None,
-                            label,
+                            ok=False,
+                            output_path=None,
+                            codec_label=label,
                             message=f"VideoWriter failed for {fourcc}/{w}x{h}",
                         )
                 if (w, h) != (width, height):
@@ -755,9 +757,9 @@ def _export_rosbag2_to_mp4(
             if frames_written <= 0:
                 output.unlink(missing_ok=True)
                 return ExportResult(
-                    False,
-                    None,
-                    label,
+                    ok=False,
+                    output_path=None,
+                    codec_label=label,
                     message=(
                         f"Topic {chosen.topic} had no decodable image frames."
                     ),
@@ -765,12 +767,12 @@ def _export_rosbag2_to_mp4(
 
             # Re-stamp container FPS from message timestamps when possible.
             fps = 30.0
-            if len(stamps) >= 2:
+            if len(stamps) >= 2:  # noqa: PLR2004
                 elapsed_ns = stamps[-1] - stamps[0]
                 if elapsed_ns > 0:
                     fps = (len(stamps) - 1) / (elapsed_ns / 1e9)
                     fps = float(min(max(fps, 1.0), 120.0))
-            if abs(fps - 30.0) > 0.5:
+            if abs(fps - 30.0) > settings.fps_restamp_tolerance:
                 progress(f"Adjusting container FPS to ~{fps:.1f}")
                 tmp_out = output.with_suffix(".retimed.mp4")
                 if _rewrite_mp4_fps(output, tmp_out, fps, used_fourcc):
@@ -782,9 +784,9 @@ def _export_rosbag2_to_mp4(
                 label if used_fourcc == fourcc else f"{label} -> {used_fourcc}"
             )
             return ExportResult(
-                True,
-                output,
-                f"{final_label} via rosbags/{chosen.topic}",
+                ok=True,
+                output_path=output,
+                codec_label=f"{final_label} via rosbags/{chosen.topic}",
                 frames=frames_written,
                 message=(
                     f"Wrote {frames_written} frames from {chosen.topic} -> {output.name}"
@@ -794,17 +796,15 @@ def _export_rosbag2_to_mp4(
         logger.exception("rosbag export failed")
         output.unlink(missing_ok=True)
         return ExportResult(
-            False,
-            None,
-            label,
+            ok=False,
+            output_path=None,
+            codec_label=label,
             message=f"ROS bag export failed: {exc}",
         )
     finally:
         if tmp_holder is not None:
-            try:
+            with contextlib.suppress(OSError):
                 tmp_holder.cleanup()
-            except OSError:
-                pass
 
 
 def _rewrite_mp4_fps(
@@ -860,7 +860,7 @@ def _export_bd3_or_db3(
     looks_ros = is_ros_folder or looks_ros_sqlite
 
     rs_try = ExportResult(
-        False, None, label, message="Skipped RealSense SDK (ROS 2 bag folder)"
+        ok=False, output_path=None, codec_label=label, message="Skipped RealSense SDK (ROS 2 bag folder)"
     )
     prefer_sdk_first = source.is_file() and source.suffix.lower() in {
         ".bag",
@@ -903,7 +903,7 @@ def _export_bd3_or_db3(
         )
         if "version" in (rs_try.message or "").lower() or "sdk" in (rs_try.message or "").lower():
             lead += (
-                "This PC’s librealsense/pyrealsense2 cannot play that file "
+                "This PC's librealsense/pyrealsense2 cannot play that file "
                 "(often recorded with a different SDK build). "
                 "Run: uv sync --extra realsense  ·  Play the Record MP4 instead. "
                 "Export cannot invent frames if the SDK cannot open the .db3.\n"
@@ -936,4 +936,4 @@ def _export_bd3_or_db3(
         "  • Elgato ROS2 bags are folders named *_color with metadata.yaml"
         + ff_extra
     )
-    return ExportResult(False, None, label, message=guidance)
+    return ExportResult(ok=False, output_path=None, codec_label=label, message=guidance)

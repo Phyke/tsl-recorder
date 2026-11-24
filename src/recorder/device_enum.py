@@ -3,7 +3,6 @@ Enumerate OpenCV capture devices and find the OBS / pyvirtualcam device.
 
 Designed to be FAST: DSHOW-first, few indices, barcode check only when needed.
 """
-from __future__ import annotations
 
 import logging
 import os
@@ -14,6 +13,7 @@ from dataclasses import dataclass
 
 import cv2
 
+from recorder.config import settings
 from recorder.frame_source import read_seq_barcode
 
 logger = logging.getLogger("poc1.device_enum")
@@ -72,7 +72,7 @@ def _probe_index(index: int, backend: int, backend_name: str) -> CameraInfo | No
         seqs.append(read_seq_barcode(frame))
     cap.release()
     valid = [s for s in seqs if isinstance(s, int)]
-    has_barcode = len(valid) >= 2
+    has_barcode = len(valid) >= settings.min_barcode_reads
     increasing = has_barcode and all(valid[j] < valid[j + 1] for j in range(len(valid) - 1))
     return CameraInfo(
         index=index,
@@ -100,10 +100,8 @@ def _try_negotiate(
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, fps)
-    try:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    except Exception:  # noqa: BLE001
-        pass
+    if not cap.set(cv2.CAP_PROP_BUFFERSIZE, 1):
+        logger.warning("Camera %d: the driver refused buffer size 1", index)
     aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     afps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
@@ -156,11 +154,12 @@ def find_capture_card_index(
                         preferred, name, aw, ah, afps,
                     )
                     return preferred, backend
-        raise RuntimeError(
+        msg = (
             f"Could not open capture card at device index={preferred}. "
             "Check Elgato is plugged in, Game Capture / 4K Capture utility is closed, "
             "and an HDMI signal is connected."
         )
+        raise RuntimeError(msg)
 
     deadline = time.time() + timeout_s
     last_err = "no devices"
@@ -179,15 +178,15 @@ def find_capture_card_index(
                     # Auto-detect: never treat a typical laptop webcam (index 0,
                     # sub-FHD) as an Elgato. Require FHD or a non-zero index with HD.
                     if preferred is None:
-                        if info.index == 0 and (aw < 1920 or ah < 1080):
+                        if info.index == 0 and (aw < settings.fhd_width or ah < settings.fhd_height):
                             continue
-                        if aw < 1280 or ah < 720:
+                        if aw < settings.hd_width or ah < settings.hd_height:
                             continue
                     score = aw * ah + int(afps * 100)
                     # Prefer true FHD when requested.
                     if aw >= width and ah >= height:
                         score += 2_000_000
-                    elif aw >= 1920 and ah >= 1080:
+                    elif aw >= settings.fhd_width and ah >= settings.fhd_height:
                         score += 1_500_000
                     if info.index > 0:
                         score += 300_000
@@ -212,11 +211,12 @@ def find_capture_card_index(
     hint = ", ".join(
         f"{d.index}/{d.backend_name}({d.width}x{d.height})" for d in non_virtual
     ) or "none"
-    raise RuntimeError(
+    msg = (
         f"Could not find capture card (Elgato / UVC). {last_err}. "
         f"Devices seen: {hint}. "
         "Try --device-index N in the GUI, or set POC1_CAPTURE_INDEX."
     )
+    raise RuntimeError(msg)
 
 
 def find_virtualcam_index(

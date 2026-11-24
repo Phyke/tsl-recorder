@@ -1,12 +1,12 @@
 """Setup-page camera card for the unified app."""
-from __future__ import annotations
 
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QCheckBox, QFrame, QHBoxLayout, QLineEdit, QMessageBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLineEdit, QMessageBox, QVBoxLayout, QWidget
 
 logger = logging.getLogger("poc1.app.cards")
 
@@ -38,6 +38,7 @@ from recorder.theme import (  # noqa: E402
     style_check_box,
     text_size,
 )
+from recorder.user_messages import capture_not_120_status  # noqa: E402
 
 if TYPE_CHECKING:
     from recorder.gui import UnifiedApp
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
 class CameraCard(QFrame):
     """One camera lane: device, config, arm, optional RealSense .bag."""
 
-    def __init__(self, master: QWidget, app: UnifiedApp, slot: CameraSlot):
+    def __init__(self, master: QWidget, app: UnifiedApp, slot: CameraSlot) -> None:
         super().__init__(master)
         self.setObjectName(f"cameraCard{slot.slot_id}")
         self.setStyleSheet(f"QFrame#cameraCard{slot.slot_id} {{ background: {PANEL}; border: 1px solid {BORDER}; }}")
@@ -154,12 +155,12 @@ class CameraCard(QFrame):
         actions_row.addWidget(self.status_label, 1)
 
     @staticmethod
-    def _label(master: QWidget, grid, text: str, row: int) -> None:
+    def _label(master: QWidget, grid: QGridLayout, text: str, row: int) -> None:
         widget = label(master, text, fg=MUTED, font_spec=("Segoe UI", 9))
         text_size(widget, chars=12, fixed=False)
         grid.addWidget(widget, row, 0, Qt.AlignmentFlag.AlignLeft)
 
-    def load_devices(self, auto_assign: bool = False) -> None:
+    def load_devices(self, *, auto_assign: bool = False) -> None:
         labels = [d.label() for d in self.session.devices]
         self._cam_by_label = {d.label(): d.cam_id for d in self.session.devices}
         set_combo_values(self.device_combo, ["Select a camera…", *labels])
@@ -231,7 +232,7 @@ class CameraCard(QFrame):
         slot.mode = opened
         self._load_modes(slot)
 
-    def _on_device(self, *_args) -> None:
+    def _on_device(self) -> None:
         if self.app.busy:
             return
         cam_id = self._cam_by_label.get(combo_text(self.device_combo))
@@ -241,7 +242,7 @@ class CameraCard(QFrame):
         try:
             slot = self.session.assign_camera(self.slot_id, cam_id)
             # A Tk StringVar trace runs once on set(); textChanged would not run for the same text.
-            blocked = self.prefix_entry.blockSignals(True)
+            blocked = self.prefix_entry.blockSignals(True)  # noqa: FBT003
             self.prefix_entry.setText(slot.prefix)
             self.prefix_entry.blockSignals(blocked)
             self._sync_prefix()
@@ -254,7 +255,7 @@ class CameraCard(QFrame):
             QMessageBox.critical(self.app.root, "Camera", str(exc))
             self.load_devices()
 
-    def _on_mode(self, *_args) -> None:
+    def _on_mode(self) -> None:
         if self.app.busy:
             return
         mode = self._mode_by_label.get(combo_text(self.mode_combo))
@@ -271,12 +272,12 @@ class CameraCard(QFrame):
         self.session.set_prefix(self.slot_id, self.prefix_entry.text())
 
     def _sync_arm(self) -> None:
-        self.session.set_armed(self.slot_id, self.arm_check.isChecked())
+        self.session.set_armed(self.slot_id, armed=self.arm_check.isChecked())
         self.app.refresh_record_gate()
 
-    def set_armed_ui(self, armed: bool) -> None:
+    def set_armed_ui(self, *, armed: bool) -> None:
         self.arm_check.setChecked(bool(armed))
-        self.session.set_armed(self.slot_id, bool(armed))
+        self.session.set_armed(self.slot_id, armed=bool(armed))
 
     def _sync_bag(self) -> None:
         self.session.slots[self.slot_id].record_bag = self.bag_check.isChecked()
@@ -298,7 +299,7 @@ class CameraCard(QFrame):
         except RuntimeError:
             pass
 
-    def _refresh_bag_enabled(self, locked: bool = False) -> None:
+    def _refresh_bag_enabled(self, *, locked: bool = False) -> None:
         slot = self.session.slots[self.slot_id]
         is_bag = slot.camera is not None and (
             slot.camera.kind == "realsense" or slot.camera.device_tag == "elgato"
@@ -307,10 +308,8 @@ class CameraCard(QFrame):
             if self.bag_check.isChecked():
                 self.bag_check.setChecked(False)
             slot.record_bag = False
-        try:
+        with contextlib.suppress(RuntimeError):
             self.bag_check.setEnabled(not (locked or not is_bag))
-        except RuntimeError:
-            pass
 
     def sync_controls(self) -> None:
         self._sync_prefix()
@@ -340,7 +339,7 @@ class CameraCard(QFrame):
         show_text(self.preview, "Preview stopped")
         self.app.refresh_record_gate()
 
-    def set_locked(self, locked: bool) -> None:
+    def set_locked(self, *, locked: bool) -> None:
         self.device_combo.setEnabled(not locked)
         self.mode_combo.setEnabled(not locked)
         self.prefix_entry.setEnabled(not locked)
@@ -368,8 +367,6 @@ class CameraCard(QFrame):
             if measured > 1:
                 status = f"{status} | delivery ~{measured:.0f}fps"
                 if wanted >= settings.high_rate_fps and measured < wanted * 0.85:
-                    from recorder.user_messages import capture_not_120_status
-
                     status += (
                         f" ({capture_not_120_status(wanted, measured, stamp)})"
                     )

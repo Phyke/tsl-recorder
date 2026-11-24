@@ -1,17 +1,18 @@
 """
-R3–R6: multi-camera session — preview ≥2 streams, per-slot arming,
+R3-R6: multi-camera session — preview ≥2 streams, per-slot arming,
 shared save folder / prefixes, single Record for all armed slots.
 
 Each slot owns its own POC-1 Pipeline instance (no shared camera handles).
 """
-from __future__ import annotations
 
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NoReturn
 
 import numpy as np
 
@@ -20,7 +21,7 @@ from recorder.camera_handler import FrameEnvelope
 from recorder.config import settings
 from recorder.devices import (
     ConnectedCamera,
-    PreviewOpenCancelled,
+    PreviewOpenCancelledError,
     StreamMode,
     build_frame_source,
     list_all_cameras,
@@ -51,8 +52,8 @@ class CameraSlot:
     mode: StreamMode | None = None
     available_modes: list[StreamMode] = field(default_factory=list)
     pipeline: Pipeline | None = None
-    last_frame: object | None = None  # numpy array
-    last_depth_frame: object | None = None
+    last_frame: np.ndarray | None = None  # numpy array
+    last_depth_frame: np.ndarray | None = None
     last_report: dict = field(default_factory=dict)
     status: str = "idle"
     record_bag: bool = False
@@ -82,16 +83,16 @@ class CameraSlot:
             self.last_frame = small
             self.last_depth_frame = depth
             self._preview_ts.append(time.time())
-            if len(self._preview_ts) > 90:
+            if len(self._preview_ts) > settings.preview_fps_history:
                 self._preview_ts = self._preview_ts[-90:]
 
-    def get_preview_frame(self):
+    def get_preview_frame(self) -> np.ndarray | None:
         with self._frame_lock:
             if self.last_frame is None:
                 return None
             return self.last_frame
 
-    def get_depth_preview_frame(self):
+    def get_depth_preview_frame(self) -> np.ndarray | None:
         with self._frame_lock:
             if self.last_depth_frame is None:
                 return None
@@ -101,12 +102,17 @@ class CameraSlot:
         """Recent live preview rate (informational only — never changes record stamp)."""
         with self._frame_lock:
             stamps = list(self._preview_ts)
-        if len(stamps) < 8:
+        if len(stamps) < settings.preview_fps_min_samples:
             return None
         elapsed = stamps[-1] - stamps[0]
-        if elapsed <= 0.05:
+        if elapsed <= settings.min_rate_window_s:
             return None
         return (len(stamps) - 1) / elapsed
+
+
+def _raise_slot_error(slot: CameraSlot, reason: str) -> NoReturn:
+    msg = f"Camera {slot.slot_id + 1} ({slot.prefix}): {reason}"
+    raise RuntimeError(msg)
 
 
 class MultiCamSession:
@@ -125,7 +131,8 @@ class MultiCamSession:
         out_dir: Path | str = Path("./recordings/deliverable1"),
     ) -> None:
         if n_slots < settings.camera_slot_range[0]:
-            raise ValueError(f"Deliverable 1 requires at least {settings.camera_slot_range[0]} camera slots (R3)")
+            msg = f"Deliverable 1 requires at least {settings.camera_slot_range[0]} camera slots (R3)"
+            raise ValueError(msg)
         self.out_dir = Path(out_dir)
         self.devices: list[ConnectedCamera] = []
         self.slots: list[CameraSlot] = [
@@ -152,7 +159,8 @@ class MultiCamSession:
     def add_slot(self) -> CameraSlot:
         """Add another independently configurable camera lane (R3)."""
         if self._recording:
-            raise RuntimeError("Stop recording before adding a camera slot")
+            msg = "Stop recording before adding a camera slot"
+            raise RuntimeError(msg)
         index = len(self.slots)
         slot = CameraSlot(
             slot_id=index,
@@ -166,11 +174,14 @@ class MultiCamSession:
     def remove_slot(self, slot_id: int) -> None:
         """Remove a camera lane while retaining the R3 minimum of two."""
         if self._recording:
-            raise RuntimeError("Stop recording before removing a camera slot")
+            msg = "Stop recording before removing a camera slot"
+            raise RuntimeError(msg)
         if len(self.slots) <= settings.camera_slot_range[0]:
-            raise RuntimeError(f"At least {settings.camera_slot_range[0]} camera slots are required (R3)")
+            msg = f"At least {settings.camera_slot_range[0]} camera slots are required (R3)"
+            raise RuntimeError(msg)
         if slot_id < 0 or slot_id >= len(self.slots):
-            raise IndexError(f"Invalid camera slot: {slot_id}")
+            msg = f"Invalid camera slot: {slot_id}"
+            raise IndexError(msg)
         self.stop_slot_preview(slot_id)
         self.slots.pop(slot_id)
         # Public methods use list position as slot_id; keep them aligned.
@@ -188,7 +199,8 @@ class MultiCamSession:
     ) -> list[ConnectedCamera]:
         """R1 — rescan UVC + RealSense (+ optional fake for demos/tests)."""
         if self.previews_running:
-            raise RuntimeError("Stop previews before refreshing the camera list")
+            msg = "Stop previews before refreshing the camera list"
+            raise RuntimeError(msg)
         self.devices = list_all_cameras(
             include_fake=include_fake,
             probe_uvc=probe_uvc,
@@ -211,15 +223,15 @@ class MultiCamSession:
             self.stop_slot_preview(slot_id)
         cam = self.find_device(cam_id)
         if cam is None:
-            raise ValueError(f"Unknown camera id: {cam_id}")
+            msg = f"Unknown camera id: {cam_id}"
+            raise ValueError(msg)
         # Avoid assigning the same physical device to two slots.
         for other in self.slots:
             if other.slot_id == slot_id:
                 continue
             if other.camera and other.camera.cam_id == cam_id:
-                raise ValueError(
-                    f"Camera {cam_id} already assigned to slot {other.slot_id}"
-                )
+                msg = f"Camera {cam_id} already assigned to slot {other.slot_id}"
+                raise ValueError(msg)
         slot.camera = cam
         slot.available_modes = list_stream_modes(cam)
         slot.mode = slot.available_modes[0] if slot.available_modes else StreamMode(
@@ -255,7 +267,7 @@ class MultiCamSession:
         p = (prefix or "").strip() or _default_prefix(slot_id)
         self.slots[slot_id].prefix = p
 
-    def set_armed(self, slot_id: int, armed: bool) -> None:
+    def set_armed(self, slot_id: int, *, armed: bool) -> None:
         """R5 — include/exclude this slot from the next Record."""
         self.slots[slot_id].armed = bool(armed)
 
@@ -263,13 +275,15 @@ class MultiCamSession:
         """R4 — shared save folder."""
         value = str(path).strip()
         if not value:
-            raise ValueError("Save folder cannot be empty")
+            msg = "Save folder cannot be empty"
+            raise ValueError(msg)
         self.out_dir = Path(value)
 
     def start_slot_preview(self, slot_id: int) -> None:
         slot = self.slots[slot_id]
         if slot.camera is None or slot.mode is None:
-            raise RuntimeError(f"Slot {slot_id}: assign camera + mode first")
+            msg = f"Slot {slot_id}: assign camera + mode first"
+            raise RuntimeError(msg)
         if slot.pipeline is not None:
             return
         # Pause companions while locking Elgato @≥90 so DirectShow gets an
@@ -287,8 +301,8 @@ class MultiCamSession:
                 try:
                     other.pipeline.camera_handler.pause_reads(timeout=1.5)
                     paused.append(other)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not pause the reads of camera slot %s", other.slot_id, exc_info=True)
         try:
             # Never silently substitute a simulated RealSense for a hardware pick.
             source = build_frame_source(
@@ -303,8 +317,8 @@ class MultiCamSession:
             except Exception:
                 try:
                     pipe.stop()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not stop the pipeline", exc_info=True)
                 raise
             slot.pipeline = pipe
             slot.status = f"preview {slot.camera.kind} {slot.mode.label()}"
@@ -314,10 +328,11 @@ class MultiCamSession:
         finally:
             for other in paused:
                 try:
-                    assert other.pipeline is not None
+                    if other.pipeline is None:
+                        _raise_slot_error(other, "has no pipeline.")
                     other.pipeline.camera_handler.resume_reads()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not resume the reads of camera slot %s", other.slot_id, exc_info=True)
 
     def stop_slot_preview(self, slot_id: int) -> None:
         slot = self.slots[slot_id]
@@ -369,7 +384,8 @@ class MultiCamSession:
         )
         for slot in ordered:
             if preview_cancel_requested():
-                raise PreviewOpenCancelled("Preview open cancelled")
+                msg = "Preview open cancelled"
+                raise PreviewOpenCancelledError(msg)
             try:
                 self.start_slot_preview(slot.slot_id)
                 # Brief pause so USB / exclusive access settles before the next open.
@@ -378,7 +394,7 @@ class MultiCamSession:
                     or (want_elgato_first and slot.camera.device_tag == "elgato")
                 ):
                     time.sleep(0.35)
-            except PreviewOpenCancelled:
+            except PreviewOpenCancelledError:
                 raise
             except Exception as exc:
                 errors.append(f"slot{slot.slot_id}: {exc}")
@@ -404,7 +420,8 @@ class MultiCamSession:
         """
         with self._lock:
             if self._recording:
-                raise RuntimeError("Already recording")
+                msg = "Already recording"
+                raise RuntimeError(msg)
             self.last_start_warnings = []
             if bag_intent is not None:
                 self.bag_intent = {int(k): bool(v) for k, v in bag_intent.items()}
@@ -412,7 +429,8 @@ class MultiCamSession:
 
             armed = [s for s in self.slots if s.armed]
             if not armed:
-                raise RuntimeError("No cameras armed — enable Armed on at least one slot")
+                msg = "No cameras armed — enable Armed on at least one slot"
+                raise RuntimeError(msg)
 
             # Elgato/UVC first so DirectShow is recording before RealSense bag
             # loads the USB bus (dual-cam left Elgato at frames_read=0 on v26).
@@ -428,49 +446,53 @@ class MultiCamSession:
 
             for s in armed:
                 if s.camera is None or s.mode is None:
-                    raise RuntimeError(
+                    msg = (
                         f"Camera {s.slot_id + 1} ({s.prefix}) is armed but has no "
                         "device/configuration. Assign a camera and mode, or uncheck Armed."
                     )
+                    raise RuntimeError(msg)
                 # Keep slot.record_bag aligned with authoritative intent for UI restore.
                 want_bag = bool(intent.get(s.slot_id, s.record_bag))
                 if s.camera.kind == "realsense" or s.camera.device_tag == "elgato":
                     s.record_bag = want_bag
                 else:
                     s.record_bag = False
-                if s.pipeline is None or not s.pipeline._preview_started:
+                if s.pipeline is None or not s.pipeline.preview_started:
                     try:
                         # Drop any half-open pipeline, then start fresh.
                         if s.pipeline is not None:
                             try:
                                 s.pipeline.stop()
-                            except Exception:  # noqa: BLE001
-                                pass
+                            except Exception:
+                                logger.debug("Could not stop the pipeline of camera slot %s", s.slot_id, exc_info=True)
                             s.pipeline = None
                         self.start_slot_preview(s.slot_id)
                     except Exception as exc:
-                        raise RuntimeError(
+                        msg = (
                             f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
                             f"preview for Record: {exc}\n\n"
                             "Check HDMI/USB, close other camera apps, then try again "
                             "— or uncheck Armed on this camera."
-                        ) from exc
+                        )
+                        raise RuntimeError(msg) from exc
                 if s.pipeline is not None and s.pipeline.source.target_fps <= 0:
                     s.pipeline.source.target_fps = 30
 
             prefixes = [s.prefix.casefold() for s in armed]
             if len(prefixes) != len(set(prefixes)):
-                raise RuntimeError(
+                msg = (
                     "Armed cameras must use different naming prefixes "
                     "(for example m and r)"
                 )
+                raise RuntimeError(msg)
 
             self.out_dir.mkdir(parents=True, exist_ok=True)
             if not self.out_dir.is_dir():
-                raise RuntimeError(f"Save folder is not a directory: {self.out_dir}")
+                msg = f"Save folder is not a directory: {self.out_dir}"
+                raise RuntimeError(msg)
             meta_dir = self.out_dir / "meta"
             meta_dir.mkdir(parents=True, exist_ok=True)
-            stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+            stamp = stamp or datetime.now(tz=timezone(timedelta(hours=7))).strftime("%Y%m%d_%H%M%S")
             paths: list[Path] = []
             started: list[CameraSlot] = []
             jobs: list[tuple[CameraSlot, Path, Path, Path | None]] = []
@@ -484,24 +506,18 @@ class MultiCamSession:
                         except Exception:  # noqa: BLE001
                             live = 0.0
                         if live >= settings.min_live_fps:
-                            s.pipeline._preview_fps_hint = live
+                            s.pipeline.preview_fps_hint = live
                     mp4 = self.out_dir / f"{s.prefix}_{stamp}.mp4"
                     csv = meta_dir / f"{s.prefix}_{stamp}_sysmon.csv"
                     bag = None
                     want_bag = bool(intent.get(s.slot_id, s.record_bag))
                     if want_bag:
                         if not s.camera:
-                            raise RuntimeError(
-                                f"Camera {s.slot_id + 1} ({s.prefix}): "
-                                ".bag is checked but no device is assigned."
-                            )
+                            _raise_slot_error(s, ".bag is checked but no device is assigned.")
                         if s.camera.kind == "realsense":
                             src = s.pipeline.source if s.pipeline else None
                             if getattr(src, "mode", "") != "hardware":
-                                raise RuntimeError(
-                                    f"Camera {s.slot_id + 1} ({s.prefix}): "
-                                    "RealSense .bag needs a live hardware stream."
-                                )
+                                _raise_slot_error(s, "RealSense .bag needs a live hardware stream.")
                             bag = with_sdk_record_suffix(
                                 self.out_dir / f"{s.prefix}_{stamp}.bag"
                             )
@@ -509,12 +525,10 @@ class MultiCamSession:
                             # ROS2 color bag (JPEG), not Intel SDK .bag.
                             bag = self.out_dir / f"{s.prefix}_{stamp}_color"
                         else:
-                            raise RuntimeError(
-                                f"Camera {s.slot_id + 1} ({s.prefix}): "
-                                "SDK/ROS bag is only for RealSense or Elgato."
-                            )
+                            _raise_slot_error(s, "SDK/ROS bag is only for RealSense or Elgato.")
                         s.record_bag = True
-                    assert s.pipeline is not None
+                    if s.pipeline is None:
+                        _raise_slot_error(s, "has no pipeline.")
                     logger.info(
                         "Record slot %d prefix=%s bag_intent=%s bag_path=%s",
                         s.slot_id,
@@ -529,17 +543,20 @@ class MultiCamSession:
                 for s, _mp4, _csv, bag in jobs:
                     if bag is None or s.camera is None or s.camera.kind != "realsense":
                         continue
-                    assert s.pipeline is not None
+                    if s.pipeline is None:
+                        _raise_slot_error(s, "has no pipeline.")
                     try:
                         s.pipeline.arm_sdk_bag(bag)
                     except Exception as exc:
-                        raise RuntimeError(
+                        msg = (
                             f"Camera {s.slot_id + 1} ({s.prefix}) could not arm "
                             f"RealSense bag: {exc}"
-                        ) from exc
+                        )
+                        raise RuntimeError(msg) from exc
 
                 for s, mp4, csv, bag in jobs:
-                    assert s.pipeline is not None
+                    if s.pipeline is None:
+                        _raise_slot_error(s, "has no pipeline.")
                     s.pipeline.station = self.station
                     try:
                         s.pipeline.start_recording(mp4, csv, bag_path=bag, hold=True)
@@ -548,54 +565,59 @@ class MultiCamSession:
                         # writer created by a failed start.
                         try:
                             s.pipeline.processor.stop()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        except Exception:
+                            logger.debug("Could not stop the processor of camera slot %s", s.slot_id, exc_info=True)
                         if mp4.exists() and mp4.stat().st_size == 0:
                             mp4.unlink(missing_ok=True)
-                        raise RuntimeError(
+                        msg = (
                             f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
                             f"recording at {s.pipeline.source.width}x"
                             f"{s.pipeline.source.height}@"
                             f"{s.pipeline.source.target_fps}: {exc}"
-                        ) from exc
+                        )
+                        raise RuntimeError(msg) from exc
 
                 # Drop frames left in each camera from preview, then start every
                 # file before any camera waits for its first recorded frame.
                 for s, _mp4, _csv, _bag in jobs:
-                    assert s.pipeline is not None
-                    s.pipeline._flush_record_start()
+                    if s.pipeline is None:
+                        _raise_slot_error(s, "has no pipeline.")
+                    s.pipeline.flush_record_start()
                 for s, _mp4, _csv, _bag in jobs:
-                    assert s.pipeline is not None
+                    if s.pipeline is None:
+                        _raise_slot_error(s, "has no pipeline.")
                     s.pipeline.commit_recording()
 
                 for s, mp4, _csv, bag in jobs:
-                    assert s.pipeline is not None
+                    if s.pipeline is None:
+                        _raise_slot_error(s, "has no pipeline.")
                     try:
-                        s.pipeline._finish_record_arm()
+                        s.pipeline.finish_record_arm()
                     except Exception as exc:
                         try:
                             s.pipeline.stop_recording()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        raise RuntimeError(
+                        except Exception:
+                            logger.debug("Could not stop the recording of camera slot %s", s.slot_id, exc_info=True)
+                        msg = (
                             f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
                             f"recording at {s.pipeline.source.width}x"
                             f"{s.pipeline.source.height}@"
                             f"{s.pipeline.source.target_fps}: {exc}"
-                        ) from exc
+                        )
+                        raise RuntimeError(msg) from exc
                     if bag is not None and s.camera and s.camera.kind == "realsense" and (
-                        s.pipeline._bag_path is None
+                        s.pipeline.active_bag_path is None
                         or not Path(bag).exists()
                         or Path(bag).stat().st_size <= 0
                     ):
                         try:
                             s.pipeline.stop_recording()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        raise RuntimeError(
-                            f"Camera {s.slot_id + 1} ({s.prefix}): .bag was checked but "
-                            f"no bag file was created at {bag.name}. "
-                            "Close RealSense Viewer, use USB 3, then try again."
+                        except Exception:
+                            logger.debug("Could not stop the recording of camera slot %s", s.slot_id, exc_info=True)
+                        _raise_slot_error(
+                            s,
+                            f".bag was checked but no bag file was created at {bag.name}. "
+                            "Close RealSense Viewer, use USB 3, then try again.",
                         )
                     s.status = f"recording → {mp4.name}"
                     if bag is not None:
@@ -607,8 +629,8 @@ class MultiCamSession:
                     try:
                         if s.pipeline:
                             s.pipeline.stop_recording()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception:
+                        logger.debug("Could not stop the recording of camera slot %s", s.slot_id, exc_info=True)
                 raise
             self._recording = True
             logger.info("D1 recording started on %d armed slot(s)", len(paths))
@@ -636,7 +658,8 @@ class MultiCamSession:
         # Phase 1: stop feeding the encoder immediately (all cameras).
         for s in targets:
             try:
-                assert s.pipeline is not None
+                if s.pipeline is None:
+                    _raise_slot_error(s, "has no pipeline.")
                 s.pipeline.camera_handler.disable_recording()
                 s.status = "stopping…"
             except Exception as exc:  # noqa: BLE001
@@ -646,7 +669,8 @@ class MultiCamSession:
 
         def _stop_one(slot: CameraSlot) -> tuple[str, dict]:
             try:
-                assert slot.pipeline is not None
+                if slot.pipeline is None:
+                    _raise_slot_error(slot, "has no pipeline.")
                 report = slot.pipeline.stop_recording()
                 slot.last_report = report
                 drops = "OK" if report.get("no_frame_drops") else "DROPS"
@@ -665,8 +689,6 @@ class MultiCamSession:
                 prefix, report = _stop_one(s)
                 reports[prefix] = report
         else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
             with ThreadPoolExecutor(
                 max_workers=min(4, len(targets)), thread_name_prefix="d1-stop"
             ) as pool:

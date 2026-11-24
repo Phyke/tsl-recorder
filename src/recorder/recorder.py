@@ -7,8 +7,8 @@ this stage measures actual capture FPS. If it differs from the configured
 target, it flags a mismatch — conversion is optional and must be requested
 explicitly (GUI warns the user; remux runs on a worker thread).
 """
-from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from dataclasses import dataclass
@@ -17,6 +17,7 @@ from pathlib import Path
 import cv2
 
 from recorder.camera_handler import DropCountingQueue
+from recorder.config import settings
 from recorder.processor import EncodedEnvelope
 
 logger = logging.getLogger("poc1.recorder")
@@ -26,6 +27,7 @@ def remux_with_fps(
     src: Path,
     dst: Path,
     fps: float,
+    *,
     fourcc_str: str,
     width: int,
     height: int,
@@ -112,7 +114,7 @@ class Recorder:
     def _measure_fps(self) -> None:
         """Compute measured FPS and flag mismatch; never remux on the stop path."""
         if (
-            self.frames_written < 2
+            self.frames_written < 2  # noqa: PLR2004
             or self._first_capture_ts is None
             or self._last_capture_ts is None
         ):
@@ -129,7 +131,7 @@ class Recorder:
         # if we never flag it.
         # Absolute floor catches 55-vs-60 (relative was ~9% and previously skipped).
         rel = abs(measured - self.fps) / max(self.fps, 1)
-        if rel < 0.08 and abs(measured - self.fps) < 3.5:
+        if rel < settings.fps_mismatch_rel and abs(measured - self.fps) < settings.fps_mismatch_abs:
             return
 
         suggested = max(1.0, round(measured, 3))
@@ -137,9 +139,9 @@ class Recorder:
         try:
             from recorder.devices import honest_container_fps
 
-            suggested = float(honest_container_fps(measured, int(round(self.fps))))
-        except Exception:  # noqa: BLE001
-            pass
+            suggested = float(honest_container_fps(measured, round(self.fps)))
+        except Exception:
+            logger.debug("Could not get the honest container fps", exc_info=True)
         self.fps_mismatch = True
         self.suggested_fps = suggested
         logger.info(
@@ -168,7 +170,7 @@ class Recorder:
             )
             tmp = self.output_path.with_suffix(".fpsfix.mp4")
             ok = remux_with_fps(
-                self.output_path, tmp, corrected, self.fourcc, self.width, self.height,
+                self.output_path, tmp, corrected, fourcc_str=self.fourcc, width=self.width, height=self.height,
             )
             if ok:
                 self.output_path.unlink(missing_ok=True)
@@ -179,10 +181,8 @@ class Recorder:
                 logger.info("FPS conversion done → %s @ %.1ffps", self.output_path, corrected)
                 return True
 
-            try:
+            with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
             logger.warning("FPS conversion failed; original file kept")
             return False
 

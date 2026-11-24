@@ -1,11 +1,12 @@
 """Operator-facing error text for the unified app (plain language, not dev jargon)."""
-from __future__ import annotations
+
+from pathlib import Path
+
+from recorder.ffmpeg_dshow_source import find_ffmpeg
 
 
 def elgato_preview_failed_message(raw_error: str) -> str:
     """Turn OpenCV/ffmpeg exceptions into actionable Elgato preview steps."""
-    from recorder.ffmpeg_dshow_source import find_ffmpeg
-
     err = (raw_error or "").strip()
     low = err.lower()
     ffmpeg_ok = bool(find_ffmpeg())
@@ -44,7 +45,6 @@ def elgato_preview_failed_message(raw_error: str) -> str:
 
 
 def preview_failed_message(
-    slot_id: int,
     raw_error: str,
     *,
     device_tag: str = "",
@@ -87,7 +87,7 @@ def no_frames_captured_message(
         + f"\n\nSave folder: {save_dir}\n\n"
         "Record-path miss (capture stalled before encode).\n"
         "1) Stop all previews → Start preview on that camera alone.\n"
-        "2) Elgato: wait for HUD “ffmpeg DirectShow” and camera ~110–120.\n"
+        "2) Elgato: wait for HUD “ffmpeg DirectShow” and camera ~110-120.\n"
         "3) Try with bag unchecked first; fully Exit OBS if it is running.\n"
         f"Build: {build_id}."
     )
@@ -95,8 +95,6 @@ def no_frames_captured_message(
 
 def bag_file_missing(report: dict) -> bool:
     """True when .bag was expected but no non-empty file/folder exists."""
-    from pathlib import Path
-
     raw = report.get("bag_path")
     if not raw:
         return True

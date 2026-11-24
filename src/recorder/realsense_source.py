@@ -5,8 +5,8 @@ When no physical device is connected, SimulatedRealSenseSource keeps the
 POC-1 RealSense *code path* testable (same pipeline, barcode proof) and
 switches to real hardware automatically when a device appears.
 """
-from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from recorder.bag_recorder import coerce_record_path, set_recording_suffix
 from recorder.frame_source import FakeFrameSource, embed_status_banner
 
 logger = logging.getLogger("poc1.realsense")
@@ -34,17 +35,17 @@ def list_realsense_devices() -> list[dict[str, str]]:
     import pyrealsense2 as rs
 
     ctx = rs.context()
-    devices = []
-    for dev in ctx.query_devices():
-        devices.append({
+    return [
+        {
             "name": dev.get_info(rs.camera_info.name),
             "serial": dev.get_info(rs.camera_info.serial_number),
             "product_line": (
                 dev.get_info(rs.camera_info.product_line)
                 if dev.supports(rs.camera_info.product_line) else ""
             ),
-        })
-    return devices
+        }
+        for dev in ctx.query_devices()
+    ]
 
 
 @dataclass
@@ -101,14 +102,15 @@ class RealSenseFrameSource:
     mode: str = field(default="hardware", init=False)
 
     _pipeline: Any = field(default=None, init=False, repr=False)
-    _bag_path: Any | None = field(default=None, init=False, repr=False)
+    active_bag_path: Any | None = field(default=None, init=False, repr=False)
 
     def start(self) -> None:
         if not realsense_available():
-            raise RuntimeError(
+            msg = (
                 "pyrealsense2 is not installed. Install with: "
                 "uv sync --extra realsense   (or pip install pyrealsense2)"
             )
+            raise RuntimeError(msg)
         import pyrealsense2 as rs
 
         self._pipeline = rs.pipeline()
@@ -128,11 +130,9 @@ class RealSenseFrameSource:
                 rs.stream.depth, dw, dh, rs.format.z16, self.target_fps
             )
         if self.bag_path:
-            from recorder.bag_recorder import coerce_record_path, set_recording_suffix
-
             bag = coerce_record_path(Path(self.bag_path))
             self.bag_path = bag
-            self._bag_path = bag
+            self.active_bag_path = bag
             try:
                 config.enable_record_to_file(str(bag))
             except RuntimeError as exc:
@@ -140,7 +140,7 @@ class RealSenseFrameSource:
                     set_recording_suffix(".db3")
                     bag = bag.with_suffix(".db3")
                     self.bag_path = bag
-                    self._bag_path = bag
+                    self.active_bag_path = bag
                     config.enable_record_to_file(str(bag))
                 else:
                     raise
@@ -169,8 +169,6 @@ class RealSenseFrameSource:
                     self.target_fps,
                 )
             if self.bag_path:
-                from recorder.bag_recorder import coerce_record_path
-
                 bag = coerce_record_path(Path(self.bag_path))
                 self.bag_path = bag
                 config.enable_record_to_file(str(bag))
@@ -190,10 +188,8 @@ class RealSenseFrameSource:
 
     def stop(self) -> None:
         if self._pipeline is not None:
-            try:
+            with contextlib.suppress(RuntimeError):
                 self._pipeline.stop()
-            except Exception:  # noqa: BLE001
-                pass
             self._pipeline = None
 
     def flush_to_live(self) -> None:
@@ -228,13 +224,15 @@ def create_realsense_source(
     height: int = 720,
     fps: int = 30,
     serial: str | None = None,
+    *,
     allow_simulate: bool = True,
 ) -> RealSenseFrameSource | SimulatedRealSenseSource:
     """Prefer real hardware; optionally fall back to simulation for POC-1."""
     if not realsense_available():
         if allow_simulate:
             return SimulatedRealSenseSource(width=width, height=height, target_fps=fps)
-        raise RuntimeError("pyrealsense2 not installed")
+        msg = "pyrealsense2 not installed"
+        raise RuntimeError(msg)
 
     devices = list_realsense_devices()
     if devices:
@@ -244,6 +242,5 @@ def create_realsense_source(
         )
     if allow_simulate:
         return SimulatedRealSenseSource(width=width, height=height, target_fps=fps)
-    raise RuntimeError(
-        "No RealSense device connected. Plug in the camera, or pass allow_simulate=True."
-    )
+    msg = "No RealSense device connected. Plug in the camera, or pass allow_simulate=True."
+    raise RuntimeError(msg)

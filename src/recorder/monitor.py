@@ -9,7 +9,6 @@ run this alongside recorder.py writing directly, without camera_handler
 in the loop at all, to isolate "can the disk sustain this" from "does
 the rest of the pipeline work."
 """
-from __future__ import annotations
 
 import csv
 import threading
@@ -41,7 +40,7 @@ class SystemMonitor:
             self._thread.join(timeout=5.0)
 
     def _loop(self) -> None:
-        with open(self.output_csv, "w", newline="") as f:
+        with self.output_csv.open("w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["timestamp", "cpu_percent", "ram_percent", "ram_used_mb", "disk_write_mb_since_start"])
             disk_start = psutil.disk_io_counters().write_bytes

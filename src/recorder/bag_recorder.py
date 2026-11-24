@@ -6,40 +6,55 @@ use ``.bag``. We default to ``.db3`` and fall back to ``.bag`` if needed.
 
 Recording is armed only at Record time — never during Start preview.
 """
-from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import NoReturn
 
 from recorder.config import settings
+from recorder.frame_source import FrameSource
 
 logger = logging.getLogger("poc1.bag")
+
 
 # Cached after first successful probe: ".bag" or ".db3"
 # Default .db3 — modern pyrealsense2 rejects .bag with:
 #   "Output file must have .db3 extension"
-_RECORD_SUFFIX: str | None = ".db3"
+@dataclass
+class _SuffixState:
+    record_suffix: str | None = ".db3"
+
+
+_state = _SuffixState()
 
 
 def _git(*args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
+    git = shutil.which("git")
+    if git is None:
+        msg = "git is not on PATH"
+        raise RuntimeError(msg)
+    result = subprocess.run(  # noqa: S603
+        [git, *args],
         cwd=Path(__file__).parent,
         capture_output=True,
         text=True,
         timeout=5,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
     )
     if result.returncode != 0 or not result.stdout.strip():
-        raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+        msg = f"git {' '.join(args)} failed: {result.stderr.strip()}"
+        raise RuntimeError(msg)
     return result.stdout.strip()
 
 
 # Build stamp so operators can confirm which code runs: "sdk-record-v{number}-{commit date} {short hash}".
-# The number is settings.poc1_last_build plus the commit count, so each commit adds 1. With no git (or no repository), the stamp is "unknown commit".
+# The number is settings.poc1_last_build plus the commit count, so each commit adds 1.
+# With no git (or no repository), the stamp is "unknown commit".
 def _build_id() -> str:
     try:
         count = int(_git("rev-list", "--count", "HEAD"))
@@ -52,24 +67,22 @@ def _build_id() -> str:
 BUILD_ID = _build_id()
 
 
-def can_record_bag(source: Any) -> bool:
+def can_record_bag(source: FrameSource) -> bool:
     return getattr(source, "mode", None) == "hardware"
 
 
 def recording_suffix() -> str:
     """Return the file suffix this pyrealsense2 build accepts for record_to_file."""
-    global _RECORD_SUFFIX
-    if _RECORD_SUFFIX:
-        return _RECORD_SUFFIX
+    if _state.record_suffix:
+        return _state.record_suffix
     return ".db3"
 
 
 def set_recording_suffix(suffix: str) -> None:
-    global _RECORD_SUFFIX
     suf = suffix if suffix.startswith(".") else f".{suffix}"
     if suf not in {".bag", ".db3"}:
         suf = ".db3"
-    _RECORD_SUFFIX = suf
+    _state.record_suffix = suf
     logger.info("RealSense SDK record suffix set to %s", suf)
 
 
@@ -110,25 +123,25 @@ def paths_to_try(path: Path) -> list[Path]:
     return out
 
 
-def _restore_wanted(source: Any, wanted: tuple[int, int, int, str]) -> None:
+def _restore_wanted(source: FrameSource, wanted: tuple[int, int, int, str]) -> None:
     w, h, fps, fmt = wanted
     source.width = w
     source.height = h
     source.target_fps = fps
     source.pixel_format = fmt
-    if hasattr(source, "_wanted"):
-        source._wanted = wanted
+    if hasattr(source, "wanted"):
+        source.wanted = wanted
 
 
-def _wanted_from_source(source: Any) -> tuple[int, int, int, str]:
+def _wanted_from_source(source: FrameSource) -> tuple[int, int, int, str]:
     wanted = (
         int(getattr(source, "width", 640)),
         int(getattr(source, "height", 480)),
         int(getattr(source, "target_fps", 30) or 30),
         str(getattr(source, "pixel_format", "bgr8") or "bgr8"),
     )
-    saved_wanted = getattr(source, "_wanted", None)
-    if isinstance(saved_wanted, tuple) and len(saved_wanted) == 4:
+    saved_wanted = getattr(source, "wanted", None)
+    if isinstance(saved_wanted, tuple) and len(saved_wanted) == 4:  # noqa: PLR2004
         wanted = (
             int(saved_wanted[0]),
             int(saved_wanted[1]),
@@ -138,7 +151,7 @@ def _wanted_from_source(source: Any) -> tuple[int, int, int, str]:
     return wanted
 
 
-def _call_start(source: Any, *, allow_fallback: bool) -> None:
+def _call_start(source: FrameSource, *, allow_fallback: bool) -> None:
     start = source.start
     try:
         start(allow_fallback=allow_fallback)
@@ -152,27 +165,32 @@ def pending_bag_path(out_dir: Path, slot_id: int, prefix: str) -> Path:
     return Path(out_dir).resolve() / f"{safe}_slot{slot_id}_recording{recording_suffix()}"
 
 
-def prearm_bag_on_source(source: Any, bag_path: Path) -> None:
+def prearm_bag_on_source(source: FrameSource, bag_path: Path) -> None:
     """No-op: never arm SDK recording during preview (causes Start preview errors)."""
     clear_bag_on_source(source)
     _ = bag_path
 
 
-def clear_bag_on_source(source: Any) -> None:
+def clear_bag_on_source(source: FrameSource) -> None:
     """Ensure preview starts without enable_record_to_file."""
     if hasattr(source, "bag_path"):
         source.bag_path = None
-    if hasattr(source, "_bag_path"):
-        source._bag_path = None
-    if hasattr(source, "_bag_final_path"):
-        source._bag_final_path = None
+    if hasattr(source, "active_bag_path"):
+        source.active_bag_path = None
+    if hasattr(source, "bag_final_path"):
+        source.bag_final_path = None
     if hasattr(source, "bag_start_paused"):
         source.bag_start_paused = False
-    if hasattr(source, "_rs_recorder"):
-        source._rs_recorder = None
+    if hasattr(source, "rs_recorder"):
+        source.rs_recorder = None
 
 
-def start_bag_recording(source: Any, bag_path: Path) -> Path:
+def _raise_no_record_file() -> NoReturn:
+    msg = "SDK created no record file after start"
+    raise RuntimeError(msg)
+
+
+def start_bag_recording(source: FrameSource, bag_path: Path) -> Path:
     """
     Restart RealSense with SDK file recording to ``bag_path``.
 
@@ -180,17 +198,19 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
     Raises RuntimeError if arming fails.
     """
     if not can_record_bag(source):
-        raise RuntimeError(
+        msg = (
             "RealSense recording requires a live [realsense] hardware device "
             "(not UVC twin / simulation)."
         )
+        raise RuntimeError(msg)
     try:
         import pyrealsense2 as rs  # noqa: F401
     except ImportError as exc:
-        raise RuntimeError(
+        msg = (
             "pyrealsense2 is not installed — cannot write RealSense bag. "
             "Run: uv sync --extra realsense"
-        ) from exc
+        )
+        raise RuntimeError(msg) from exc
 
     # Attach to the running preview streams when they are the record streams: no stop and no start at Record.
     attach = getattr(source, "attach_bag", None)
@@ -207,8 +227,8 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
     last_exc: BaseException | None = None
     candidates = paths_to_try(Path(bag_path))
 
-    for candidate in candidates:
-        candidate = candidate.resolve()
+    for raw_candidate in candidates:
+        candidate = raw_candidate.resolve()
         candidate.parent.mkdir(parents=True, exist_ok=True)
         if candidate.exists():
             try:
@@ -222,13 +242,13 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
             try:
                 try:
                     source.stop()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not stop the source", exc_info=True)
                 time.sleep(0.12 * attempt)
 
                 source.bag_path = candidate
-                source._bag_path = candidate
-                source._bag_final_path = candidate
+                source.active_bag_path = candidate
+                source.bag_final_path = candidate
                 # Write nothing until the MP4 recorders arm. enable_record_to_file
                 # starts at pipeline.start(); pause runs immediately after that.
                 if hasattr(source, "bag_start_paused"):
@@ -238,7 +258,7 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
 
                 paused = bool(
                     getattr(source, "bag_start_paused", False)
-                    and getattr(source, "_rs_recorder", None) is not None
+                    and getattr(source, "rs_recorder", None) is not None
                     and getattr(source, "_pipeline", None) is not None
                 )
                 if not paused:
@@ -246,8 +266,8 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                     for _ in range(12):
                         try:
                             _ = source.read()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        except Exception:
+                            logger.debug("Could not read a frame from the source", exc_info=True)
                         if candidate.exists():
                             try:
                                 size = candidate.stat().st_size
@@ -260,7 +280,7 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                         time.sleep(0.05)
 
                     if candidate.exists() and candidate.stat().st_size <= 0 and getattr(source, "_pipeline", None) is None:
-                        raise RuntimeError("SDK created no record file after start")
+                        _raise_no_record_file()
 
                 set_recording_suffix(candidate.suffix)
                 flush = getattr(source, "flush_to_live", None)
@@ -291,8 +311,8 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
                     clear_bag_on_source(source)
                     if candidate.exists() and candidate.is_file() and candidate.stat().st_size == 0:
                         candidate.unlink(missing_ok=True)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception:
+                    logger.debug("Could not clean up the empty bag file", exc_info=True)
                 if "db3" in msg and candidate.suffix.lower() == ".bag":
                     set_recording_suffix(".db3")
                     break
@@ -311,24 +331,25 @@ def start_bag_recording(source: Any, bag_path: Path) -> Path:
             time.sleep(0.3)
             try:
                 _call_start(source, allow_fallback=False)
-            except Exception:
+            except (RuntimeError, ValueError):
                 _restore_wanted(source, wanted)
                 _call_start(source, allow_fallback=True)
     except Exception:
         logger.exception("Could not restore RealSense preview after record failure")
 
-    raise RuntimeError(
+    msg_0 = (
         f"Could not start RealSense SDK recording ({Path(bag_path).name}). "
         f"Last error: {last_exc}. "
-        "This PC’s RealSense SDK may require .db3 instead of .bag (or the reverse). "
+        "This PC's RealSense SDK may require .db3 instead of .bag (or the reverse). "
         "Close Intel RealSense Viewer, use USB 3, then Record again."
     )
+    raise RuntimeError(msg_0)
 
 
-def stop_bag_recording(source: Any) -> Path | None:
+def stop_bag_recording(source: FrameSource) -> Path | None:
     """Finalize SDK recording by stopping the pipeline, then restore preview."""
-    path = getattr(source, "_bag_path", None) or getattr(source, "bag_path", None)
-    final = getattr(source, "_bag_final_path", None) or path
+    path = getattr(source, "active_bag_path", None) or getattr(source, "bag_path", None)
+    final = getattr(source, "bag_final_path", None) or path
     if not path or not can_record_bag(source):
         clear_bag_on_source(source)
         return None
@@ -339,8 +360,8 @@ def stop_bag_recording(source: Any) -> Path | None:
         if hasattr(source, "pause_bag"):
             try:
                 source.pause_bag()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                logger.debug("Could not pause the bag", exc_info=True)
             # Let the SDK write the frames it already accepted before the
             # pipeline is torn down. Stopping immediately drops that tail,
             # so the MP4 (still draining its queue) ends up longer than the .db3.
@@ -350,8 +371,8 @@ def stop_bag_recording(source: Any) -> Path | None:
         detached = bool(callable(detach) and detach())
         if not detached:
             source.stop()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:
+        logger.debug("Could not detach or stop the bag source", exc_info=True)
 
     clear_bag_on_source(source)
     if not detached:
@@ -359,7 +380,7 @@ def stop_bag_recording(source: Any) -> Path | None:
         _restore_wanted(source, wanted)
         try:
             _call_start(source, allow_fallback=False)
-        except Exception:
+        except (RuntimeError, ValueError):
             try:
                 _restore_wanted(source, wanted)
                 _call_start(source, allow_fallback=True)
