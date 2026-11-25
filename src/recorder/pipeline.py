@@ -20,7 +20,7 @@ import numpy as np
 
 from recorder.bag_recorder import start_bag_recording, stop_bag_recording
 from recorder.camera_handler import CameraHandler, FrameEnvelope
-from recorder.config import settings
+from recorder.config import RecordingSettings, recording_settings_for, settings
 from recorder.device_enum import quiet_opencv
 from recorder.frame_source import FrameSource
 from recorder.monitor import SystemMonitor
@@ -67,8 +67,9 @@ class CvCaptureSource:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             self._cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-            if not self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1):
-                logger.warning("Camera %d: the driver refused buffer size 1", self.device_index)
+            buf = recording_settings_for(getattr(self, "device_tag", "")).driver_buffer_frames
+            if not self._cap.set(cv2.CAP_PROP_BUFFERSIZE, float(buf)):
+                logger.warning("Camera %d: the driver refused buffer size %d", self.device_index, buf)
             self.actual_fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0)
             self.actual_width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width)
             self.actual_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height)
@@ -115,10 +116,15 @@ class Pipeline:
         self.active_bag_path: Path | None = None
         self._bag_written: Path | None = None
         self._uvc_bag = None
+        # The ffmpeg real-time buffer drops at the record start, and the drops and the last fill % of the last take (fixed at Stop).
+        self._rtbuf_base = 0
+        self._rtbuf_take: tuple[int, int] | None = None
         self._record_held = False
         self._pending_uvc_bag: Path | None = None
         self._record_allow_remux = True
         self._record_output_path: Path | None = None
+        # The step of the record start or stop, for the status line of the Record tab (see record_status).
+        self.record_phase = ""
 
     def start_preview(self) -> None:
         if self.preview_started:
@@ -137,6 +143,7 @@ class Pipeline:
         if tag == "elgato":
             msg = "Elgato bag starts after Record frames are flowing"
             raise RuntimeError(msg)
+        self.record_phase = "starting"
         self.camera_handler.pause_reads()
         try:
             active = start_bag_recording(self.source, bag_path)
@@ -170,6 +177,7 @@ class Pipeline:
         *,
         hold: bool = False,
     ) -> None:
+        rec = self._begin_record()
         if not self.preview_started:
             self.start_preview()
         self.output_path = output_path
@@ -234,7 +242,7 @@ class Pipeline:
             codec_label=self.processor.codec_label,
             correct_container_fps=allow_remux,
         )
-        self.monitor = SystemMonitor(output_csv=monitor_csv)
+        self.monitor = SystemMonitor(output_csv=monitor_csv, interval_s=rec.monitor_interval_ms / 1000)
 
         # Workers first (queue must drain), then arm. Puts are non-blocking so
         # arming cannot stall the Elgato read loop.
@@ -252,6 +260,18 @@ class Pipeline:
         self._record_held = False
         self.release_recording()
         self.finish_record_arm()
+
+    # The start of a Record: the status line shows Starting, and the processor takes the MP4 codec and the drain
+    # limit of the Recording settings of this camera type.
+    def _begin_record(self) -> RecordingSettings:
+        self.record_phase = "starting"
+        rtbuf = self._ffmpeg_rtbuf()
+        self._rtbuf_base = rtbuf[0] if rtbuf is not None else 0
+        self._rtbuf_take = None
+        rec = recording_settings_for(str(getattr(self.source, "device_tag", "") or ""))
+        self.processor.codec = rec.mp4_codec
+        self.processor.drain_s = float(rec.mp4_drain_s)
+        return rec
 
     def flush_record_start(self) -> None:
         """Drop frames already sitting in the capture buffer before this take."""
@@ -283,6 +303,7 @@ class Pipeline:
         monitor_csv = self.monitor_csv
         pending_uvc_bag = self._pending_uvc_bag
         tag = str(getattr(self.source, "device_tag", "") or "")
+        rec = recording_settings_for(tag)
         if not self.camera_handler.wait_recorded_frames(2.0):
             logger.warning(
                 "Record armed but frames_read=0 (tag=%s) — recovering capture",
@@ -317,7 +338,7 @@ class Pipeline:
                 codec_label=self.processor.codec_label,
                 correct_container_fps=allow_remux,
             )
-            self.monitor = SystemMonitor(output_csv=monitor_csv)
+            self.monitor = SystemMonitor(output_csv=monitor_csv, interval_s=rec.monitor_interval_ms / 1000)
             self.camera_handler.processor_queue.clear()
             self.processor.out_queue.clear()
             self.processor.start()
@@ -345,14 +366,19 @@ class Pipeline:
                 if output_path.exists() and output_path.stat().st_size == 0:
                     output_path.unlink(missing_ok=True)
                 msg = (
-                    f"Record got 0 frames from {tag or 'camera'} after capture recovery. "
+                    f"Record got 0 frames from {tag or 'camera'} after capture recovery.\n"
                     "Stop all previews → Start preview on this camera alone → wait for "
                     "moving live video → Record with bag unchecked first."
                 )
                 raise RuntimeError(msg)
 
         if pending_uvc_bag is not None:
-            self._uvc_bag = UvcRos2Bag(pending_uvc_bag)
+            self._uvc_bag = UvcRos2Bag(
+                pending_uvc_bag,
+                queue_frames=rec.db3_queue_frames,
+                jpeg_quality=rec.db3_jpeg_quality,
+                drain_s=float(rec.db3_drain_s),
+            )
             self._uvc_bag.start()
             self.active_bag_path = pending_uvc_bag
             self.processor.sidecar_bag = self._uvc_bag
@@ -367,6 +393,7 @@ class Pipeline:
             getattr(self, "_requested_fps", self.source.target_fps),
             int(self.camera_handler.frames_read),
         )
+        self.record_phase = "recording"
 
     def _align_capture_fps(self) -> None:
         """Stamp MP4 at the real delivery rate. Never steal the live UVC handle."""
@@ -417,6 +444,7 @@ class Pipeline:
 
     def stop_recording(self) -> dict:
         """Stop record path, keep preview alive if it was running."""
+        self.record_phase = "stopping"
         expected_bag = None
         if self.active_bag_path is not None:
             expected_bag = (
@@ -428,6 +456,8 @@ class Pipeline:
             self.camera_handler.disable_recording()
         except Exception:
             logger.exception("disable_recording failed")
+        rtbuf = self._ffmpeg_rtbuf()
+        self._rtbuf_take = (max(rtbuf[0] - self._rtbuf_base, 0), rtbuf[1]) if rtbuf is not None else None
         # Pause the .db3 on the same beat the MP4 stops accepting frames.
         # Doing this after pause_reads lets the SDK keep writing while Python
         # has already stopped, or the other way around if the queue still drains.
@@ -453,6 +483,7 @@ class Pipeline:
                 except Exception:
                     logger.debug("Could not resume reads", exc_info=True)
         if self.processor:
+            self.record_phase = "draining_mp4"
             try:
                 self.processor.stop()
             except Exception:
@@ -460,6 +491,7 @@ class Pipeline:
         bag_dropped = 0
         bag_frames = 0
         if self._uvc_bag is not None:
+            self.record_phase = "finishing_db3"
             try:
                 bag_dropped = int(getattr(self._uvc_bag, "dropped", 0) or 0)
                 bag_frames = int(getattr(self._uvc_bag, "frames_written", 0) or 0)
@@ -470,6 +502,7 @@ class Pipeline:
                 logger.exception("UVC ROS2 bag stop failed")
             self._uvc_bag = None
             self.processor.sidecar_bag = None
+        self.record_phase = "saving"
         if self.recorder:
             try:
                 self.recorder.stop()
@@ -518,10 +551,11 @@ class Pipeline:
             else:
                 msg = (
                     f"MP4 was saved, but RealSense .bag was not "
-                    f"(expected {Path(expected_bag).name}). "
+                    f"(expected {Path(expected_bag).name}).\n"
                     "Close RealSense Viewer, use USB 3, check Also save RealSense .bag, "
                     "then Record again."
                 )
+                self.record_phase = "failed"
                 raise RuntimeError(msg)
         # Auto-fix Elgato/webcam playback when stamp still disagrees with delivery.
         if (
@@ -532,12 +566,77 @@ class Pipeline:
                 or bool(getattr(self.source, "allow_fps_remux", False))
             )
         ):
+            self.record_phase = "fixing_fps"
             try:
                 if self.convert_container_fps():
                     report = self.last_report or self.report()
             except Exception:
                 logger.exception("auto FPS convert failed")
+        self.record_phase = "saved"
         return report
+
+    # The status of this camera on the Record tab: the phase, the detail text, and the queues (record_queues).
+    # The phase is "" when no record start or stop has happened yet, and "saved_dropped" for a saved take with dropped frames.
+    def record_status(self) -> tuple[str, str, list[tuple[str, float | None, str]]]:
+        queues = self.record_queues()
+        mp4_queue = self.camera_handler.processor_queue
+        bag = self._uvc_bag
+        if self.record_phase == "recording":
+            text = "Writing the MP4"
+            if bag is not None:
+                text = "Writing the MP4 and the .db3"
+            elif self.active_bag_path is not None:
+                text = "Writing the MP4\nThe RealSense SDK writes the .db3 (its queue is not readable)"
+            return "recording", text, queues
+        if self.record_phase == "saved":
+            report = self.last_report
+            dropped = sum(int(report.get(key, 0) or 0) for key in ("dropped_processor_queue", "dropped_recorder_queue", "bag_dropped"))
+            dropped += self._rtbuf_take[0] if self._rtbuf_take is not None else 0
+            text =f"{report.get('frames_written', 0)} frames written  ·  {dropped} dropped  ·  ready for the next take"
+            return ("saved_dropped" if dropped else "saved"), text, queues
+        statuses = {
+            "starting": "Opening the writers…",
+            "stopping": "No new frames; the .db3 closes…",
+            "draining_mp4": f"{mp4_queue.qsize()} frames left in the MP4 queue",
+            "finishing_db3": f"{bag.queued() if bag is not None else 0} frames left in the .db3 queue",
+            "saving": "Closing the files…",
+            "fixing_fps": "Fixing the MP4 playback speed…",
+            "failed": "See the status bar for the cause",
+        }
+        return self.record_phase, statuses.get(self.record_phase, ""), queues
+
+    # The buffers and queues of this camera that the app can read, in the order of the frames: (name, fill from 0 to 1
+    # or None for no bar, count text). The real-time buffer has no fill value: ffmpeg reports only its drops. Its
+    # drops count from the record start, and are fixed at Stop. The ffmpeg queue has no drop count. The .db3 queue
+    # shows only while a .db3 is open.
+    def record_queues(self) -> list[tuple[str, float | None, str]]:
+        queues: list[tuple[str, float | None, str]] = []
+
+        def add(name: str, queued: int, limit: int, dropped: int | None) -> None:
+            text = f"{queued} / {limit}" + ("" if dropped is None else f"  ·  dropped {dropped}")
+            queues.append((name, queued / max(limit, 1), text))
+
+        rtbuf = self._ffmpeg_rtbuf()
+        if rtbuf is not None:
+            drops, percent = self._rtbuf_take or (max(rtbuf[0] - self._rtbuf_base, 0), rtbuf[1])
+            queues.append(("Real-time buffer", None, f"dropped {drops}" + (f"  ·  last drop at {percent} % full" if drops else "")))
+        ffmpeg_queue = getattr(self.source, "ffmpeg_queue", None)
+        ffmpeg_fill = ffmpeg_queue() if callable(ffmpeg_queue) else None
+        if ffmpeg_fill is not None:
+            add("ffmpeg queue", ffmpeg_fill[0], ffmpeg_fill[1], None)
+        mp4_queue = self.camera_handler.processor_queue
+        add("MP4 queue", mp4_queue.qsize(), mp4_queue.maxsize, mp4_queue.dropped_count)
+        bag = self._uvc_bag
+        if bag is not None:
+            add(".db3 queue", bag.queued(), bag.queue_limit, bag.dropped)
+        recorder_queue = self.processor.out_queue
+        add("Recorder queue", recorder_queue.qsize(), recorder_queue.maxsize, recorder_queue.dropped_count)
+        return queues
+
+    # The ffmpeg real-time buffer of the source (drops since the lock, fill % at the last drop), or None without ffmpeg.
+    def _ffmpeg_rtbuf(self) -> tuple[int, int] | None:
+        rtbuf = getattr(self.source, "ffmpeg_rtbuf", None)
+        return rtbuf() if callable(rtbuf) else None
 
     def stop(self) -> dict:
         """Full shutdown (recording + preview + camera)."""

@@ -22,10 +22,13 @@ class UvcRos2Bag:
     encoded on the processor thread so the bag queue stays small.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, queue_frames: int = 512, jpeg_quality: int = 80, drain_s: float = 25.0) -> None:
         self.path = Path(path)
-        # ~4s at 120fps — overflow still increments ``dropped`` (honest report).
-        self._q: queue.Queue[tuple[bytes, int] | None] = queue.Queue(maxsize=512)
+        # The default 512 is ~4s at 120fps — overflow still increments ``dropped`` (honest report).
+        self.queue_limit = queue_frames
+        self.jpeg_quality = jpeg_quality
+        self.drain_s = drain_s
+        self._q: queue.Queue[tuple[bytes, int] | None] = queue.Queue(maxsize=queue_frames)
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._error: str | None = None
@@ -46,8 +49,12 @@ class UvcRos2Bag:
         logger.info("Elgato/UVC ROS2 bag -> %s", self.path)
         return self.path
 
+    # The JPEG frames that wait for the .db3 write (the Record status line reads it).
+    def queued(self) -> int:
+        return self._q.qsize()
+
     def submit(self, bgr: np.ndarray, capture_ts: float) -> None:
-        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
         if not ok:
             return
         ns = int(capture_ts * 1e9)
@@ -59,7 +66,7 @@ class UvcRos2Bag:
     def stop(self) -> Path | None:
         # Let the worker finish queued JPEGs before sentinel (no software loss
         # at Stop when encode can keep up).
-        deadline = time.monotonic() + 25.0
+        deadline = time.monotonic() + self.drain_s
         while not self._q.empty() and time.monotonic() < deadline:
             time.sleep(0.02)
         try:

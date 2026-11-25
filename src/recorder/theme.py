@@ -3,6 +3,7 @@
 import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Qt
@@ -29,8 +30,8 @@ BG = "#eef2f6"
 PANEL = "#ffffff"
 SURFACE = "#f8fafc"
 INK = "#0f172a"
-MUTED = "#64748b"
-BORDER = "#d0d7e2"
+MUTED = "#3f4d61"
+BORDER = "#7f8ca0"
 ACCENT = "#0f766e"
 ACCENT_SOFT = "#ccfbf1"
 BLUE = "#1d4ed8"
@@ -53,6 +54,9 @@ _state = _ThemeState(font_size=settings.font_size)
 
 _names = itertools.count(1)
 
+# The dropdown arrow. A styled drop-down part has no arrow of its own.
+_COMBO_ARROW = Path(__file__).with_name("combo_arrow.svg").as_posix()
+
 
 def apply_styles(app: QApplication) -> None:
     # Tk ignores the Windows dark mode, so the Qt palette stays light too.
@@ -65,14 +69,17 @@ def apply_styles(app: QApplication) -> None:
     app.setStyleSheet(
         f"""
         QComboBox {{ background: {FIELD}; color: {INK}; border: 1px solid {BORDER}; padding: 3px 6px; }}
-        QComboBox:disabled {{ background: #e2e8f0; color: #94a3b8; }}
+        QComboBox::drop-down {{ border: 0; width: 20px; }}
+        QComboBox::down-arrow {{ image: url("{_COMBO_ARROW}"); width: 10px; height: 6px; }}
+        QComboBox:disabled {{ background: #e2e8f0; color: #556377; }}
         QComboBox QAbstractItemView {{ background: {FIELD}; color: {INK};
             selection-background-color: {ACCENT}; selection-color: #ffffff; }}
         QLineEdit {{ background: {FIELD}; color: {INK}; border: 1px solid {INK}; padding: 3px; }}
-        QLineEdit:disabled {{ background: #e2e8f0; color: #94a3b8; }}
+        QLineEdit:disabled {{ background: #e2e8f0; color: #556377; }}
         QTabWidget::pane {{ border: 0; background: {BG}; }}
-        QTabBar::tab {{ background: {SURFACE}; color: {MUTED}; padding: 10px 18px;
+        QTabBar::tab {{ background: {SURFACE}; color: {MUTED}; padding: 10px 18px; border: 1px solid {BORDER};
             font-family: "Segoe UI Semibold"; font-size: {tab_size:g}pt; }}
+        QTabBar::tab:!first {{ border-left: 0; }}
         QTabBar::tab:selected {{ background: {PANEL}; color: {INK}; }}
         QGroupBox {{ color: {INK}; }}
         QMessageBox QLabel, QMessageBox QPushButton {{ {message_font} }}

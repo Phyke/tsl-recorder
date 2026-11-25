@@ -37,6 +37,9 @@ class EncodedEnvelope:
 class Processor:
     in_queue: DropCountingQueue
     out_queue_size: int = 512
+    # The MP4 codec ("auto" or "mp4v") and the longest drain at Stop (s): the pipeline sets them at each Record.
+    codec: str = "auto"
+    drain_s: float = 60.0
 
     def __post_init__(self) -> None:
         self.out_queue: DropCountingQueue[EncodedEnvelope] = DropCountingQueue(
@@ -73,6 +76,8 @@ class Processor:
         if fourcc:
             self.chosen_fourcc = fourcc
             self.codec_label = fourcc
+        elif self.codec == "mp4v":
+            self.chosen_fourcc, self.codec_label = "mp4v", "MPEG-4 (mp4v)"
         else:
             self.chosen_fourcc, self.codec_label = choose_best_fourcc()
 
@@ -128,7 +133,7 @@ class Processor:
                 logger.warning("processor thread still encoding; continuing drain")
             self._thread = None
         drained = 0
-        deadline = time.perf_counter() + 60.0
+        deadline = time.perf_counter() + self.drain_s
         while time.perf_counter() < deadline:
             env = self.in_queue.get(timeout=0.05)
             if env is None:

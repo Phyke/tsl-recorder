@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 
 from recorder.bag_recorder import coerce_record_path, set_recording_suffix
-from recorder.config import settings
+from recorder.config import recording_settings_for, settings
 from recorder.device_enum import quiet_opencv
 from recorder.ffmpeg_dshow_source import FfmpegDshowCaptureSource, _lock_threshold, dshow_input_names, find_ffmpeg
 from recorder.frame_source import FakeFrameSource, FrameSource
@@ -802,7 +802,7 @@ def _open_uvc_timeout(target: str | int, backend: int, timeout_s: float = 3.0) -
             cap = future.result(timeout=timeout_s)
         except FuturesTimeout as exc:
             msg = (
-                f"Camera open timed out ({target!r}). Close Zoom/Teams/Camera "
+                f"Camera open timed out ({target!r}).\nClose Zoom/Teams/Camera "
                 "and any other POC1 window, then Refresh."
             )
             raise RuntimeError(msg) from exc
@@ -869,31 +869,31 @@ def _uvc_open_failure_message(
         ff_hint = ""
         if not ffmpeg_available():
             ff_hint = (
-                " ffmpeg is missing — install ffmpeg on PATH so Refresh uses "
+                "\nffmpeg is missing — install ffmpeg on PATH so Refresh uses "
                 "DirectShow device names (PnP labels often fail to open)."
             )
         if opened_once:
             return (
                 f"Elgato opened but delivered no frames{detail}."
-                " Fully quit OBS (not minimize), Elgato 4K Capture Utility, and"
-                " RealSense Viewer. HDMI ON at 1080p120 for true 120, then Start preview."
+                "\nFully quit OBS (not minimize), Elgato 4K Capture Utility, and"
+                " RealSense Viewer.\nHDMI ON at 1080p120 for true 120, then Start preview."
                 + ff_hint
             )
         return (
             f"Could not open Elgato capture card{detail}."
-            " Fully quit OBS, Elgato 4K Capture Utility, Zoom, Teams, and Windows Camera."
-            " Confirm HDMI is on, click Refresh, then Start preview on the Elgato card alone."
+            "\nFully quit OBS, Elgato 4K Capture Utility, Zoom, Teams, and Windows Camera."
+            "\nConfirm HDMI is on, click Refresh, then Start preview on the Elgato card alone."
             + ff_hint
         )
     if opened_once:
         return (
             f"UVC device opened but delivered no frames{detail}."
-            " Close Zoom/Teams/Camera and other POC1 windows, then Refresh."
-            " Use 1280x720@30 mjpg for the laptop webcam."
+            "\nClose Zoom/Teams/Camera and other POC1 windows, then Refresh."
+            "\nUse 1280x720@30 mjpg for the laptop webcam."
         )
     return (
         f"Could not open UVC device{detail}."
-        " Close other camera apps and click Refresh."
+        "\nClose other camera apps and click Refresh."
     )
 
 
@@ -1070,7 +1070,7 @@ class FormattedUvcSource(CvCaptureSource):
         raise RuntimeError(
             f"Could not open UVC device index={self.device_index}"
             + (f" path={self.open_path!r}" if self.open_path else "")
-            + f" ({last_error}). Close other camera apps and click Refresh."
+            + f" ({last_error}).\nClose other camera apps and click Refresh."
         )
 
     def _configure_and_grab(
@@ -1093,7 +1093,8 @@ class FormattedUvcSource(CvCaptureSource):
         _apply_uvc_fourcc(cap, fmt)
         for _ in range(3):
             cap.set(cv2.CAP_PROP_FPS, float(fps))
-        buf = 4 if fps >= settings.deep_buffer_fps else 1
+        rec = recording_settings_for(getattr(self, "device_tag", ""))
+        buf = rec.driver_buffer_frames_deep if fps >= rec.deep_buffer_fps else rec.driver_buffer_frames
         if not cap.set(cv2.CAP_PROP_BUFFERSIZE, float(buf)):
             logger.warning("The driver refused buffer size %d", buf)
         warm = 20 if is_elgato else 4
@@ -1153,8 +1154,9 @@ class FormattedUvcSource(CvCaptureSource):
                     accepted = cap.set(cv2.CAP_PROP_FPS, float(val))
                 if not accepted:
                     logger.warning("Elgato OBS-pin try#%d: the driver refused %s=%s", seq_i + 1, key, val)
-            if not cap.set(cv2.CAP_PROP_BUFFERSIZE, 8.0):
-                logger.warning("Elgato OBS-pin try#%d: the driver refused buffer size 8", seq_i + 1)
+            buf = settings.recording_elgato.obs_pin_buffer_frames
+            if not cap.set(cv2.CAP_PROP_BUFFERSIZE, float(buf)):
+                logger.warning("Elgato OBS-pin try#%d: the driver refused buffer size %d", seq_i + 1, buf)
             frame = None
             for _ in range(50):
                 ok, candidate = cap.read()
@@ -1636,11 +1638,11 @@ class FormattedUvcSource(CvCaptureSource):
                 if want_high:
                     raise RuntimeError(
                         f"Could not open Elgato at {wanted_w}x{wanted_h}@{wanted_fps} "
-                        f"(OpenCV and ffmpeg DirectShow both failed; no silent 720p fallback). "
+                        f"(OpenCV and ffmpeg DirectShow both failed; no silent 720p fallback).\n"
                         f"Fully quit OBS / Elgato Utility / Viewer, confirm HDMI is "
                         f"{wanted_w}x{wanted_h}@120, install ffmpeg on PATH, Refresh, "
                         f"then Start preview on the Elgato alone."
-                        + (f" Last error: {last_exc}" if last_exc else "")
+                        + (f"\nLast error: {last_exc}" if last_exc else "")
                     )
                 raise RuntimeError(
                     _uvc_open_failure_message(
@@ -1664,8 +1666,8 @@ class FormattedUvcSource(CvCaptureSource):
                 if find_ffmpeg():
                     msg = (
                         f"Elgato opened at ~{rate:.0f}fps but mode is "
-                        f"{wanted_w}x{wanted_h}@{wanted_fps}. "
-                        "ffmpeg is installed but could not lock -vcodec mjpeg at 120. "
+                        f"{wanted_w}x{wanted_h}@{wanted_fps}.\n"
+                        "ffmpeg is installed but could not lock -vcodec mjpeg at 120.\n"
                         "Fully quit OBS, confirm HDMI 1080p120, Start preview on "
                         "Elgato alone, then check logs for 'ffmpeg dshow LOCKED'."
                     )
@@ -1716,6 +1718,16 @@ class FormattedUvcSource(CvCaptureSource):
                 mean,
             )
         self._log_d1_uvc_start()
+
+    # The ffmpeg frame queue (frames in the queue, queue size), or None when OpenCV reads the camera.
+    def ffmpeg_queue(self) -> tuple[int, int] | None:
+        ff = self._ffmpeg
+        return None if ff is None else (ff.queued(), ff.queue_limit)
+
+    # The ffmpeg real-time buffer (frames dropped since the lock, fill % at the last drop), or None when OpenCV reads the camera.
+    def ffmpeg_rtbuf(self) -> tuple[int, int] | None:
+        ff = self._ffmpeg
+        return None if ff is None else (ff.rtbuf_drops, ff.rtbuf_last_percent)
 
     def read(self) -> np.ndarray | None:
         if self._ffmpeg is not None:
@@ -1805,9 +1817,9 @@ class ConfiguredRealSenseSource:
         devices = list(rs.context().query_devices())
         if not devices:
             msg = (
-                "No RealSense device found by the Intel SDK (pyrealsense2). "
+                "No RealSense device found by the Intel SDK (pyrealsense2).\n"
                 "Close Intel RealSense Viewer and any other app using the camera, "
-                "use a USB 3 port, then click Refresh. "
+                "use a USB 3 port, then click Refresh.\n"
                 "Install the SDK extra with: uv sync --extra realsense"
             )
             raise RuntimeError(msg)
@@ -1817,8 +1829,8 @@ class ConfiguredRealSenseSource:
         serials = [d.get_info(rs.camera_info.serial_number) for d in devices]
         if self.serial not in serials:
             msg = (
-                f"RealSense serial {self.serial} is not connected. "
-                f"Connected: {', '.join(serials) or '(none)'}. Click Refresh."
+                f"RealSense serial {self.serial} is not connected.\n"
+                f"Connected: {', '.join(serials) or '(none)'}.\nClick Refresh."
             )
             raise RuntimeError(msg)
 
@@ -1961,7 +1973,7 @@ class ConfiguredRealSenseSource:
     def start(self, *, allow_fallback: bool = True) -> None:
         if not realsense_available():
             msg = (
-                "pyrealsense2 is not installed. Run: "
+                "pyrealsense2 is not installed.\nRun: "
                 "uv sync --extra dev --extra realsense"
             )
             raise RuntimeError(msg)
@@ -2067,9 +2079,9 @@ class ConfiguredRealSenseSource:
 
         if pipeline is None or profile is None:
             raise RuntimeError(
-                "RealSense rejected every profile tried. "
-                "Close Intel RealSense Viewer, reconnect USB3, then Refresh. "
-                + " | ".join(errors[-3:])
+                "RealSense rejected every profile tried.\n"
+                "Close Intel RealSense Viewer, reconnect USB3, then Refresh.\n"
+                + "\n".join(errors[-3:])
             )
 
         try:
@@ -2157,9 +2169,9 @@ class ConfiguredRealSenseSource:
         except Exception as exc:
             self.stop()
             msg_0 = (
-                "RealSense stream opened but no frame arrived. "
+                "RealSense stream opened but no frame arrived.\n"
                 "Close Intel RealSense Viewer and other camera apps, use USB 3, "
-                f"then try again (wanted {wanted[0]}x{wanted[1]}@{wanted[2]} {wanted[3]}). "
+                f"then try again (wanted {wanted[0]}x{wanted[1]}@{wanted[2]} {wanted[3]}).\n"
                 f"SDK error: {exc}"
             )
             raise RuntimeError(msg_0) from exc
@@ -2405,7 +2417,7 @@ def build_frame_source(
     if camera.kind == "realsense":
         if not realsense_available():
             msg = (
-                "RealSense selected but pyrealsense2 is not installed. "
+                "RealSense selected but pyrealsense2 is not installed.\n"
                 "Run: uv sync --extra realsense"
             )
             raise RuntimeError(msg)

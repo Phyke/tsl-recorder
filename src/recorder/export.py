@@ -292,7 +292,7 @@ def _export_realsense_bag(
             ok=False,
             output_path=None,
             codec_label=label,
-            message="pyrealsense2 is required for RealSense .bag/.db3 export. "
+            message="pyrealsense2 is required for RealSense .bag/.db3 export.\n"
             "Run: uv sync --extra realsense",
         )
 
@@ -670,7 +670,7 @@ def _export_rosbag2_to_mp4(
             output_path=None,
             codec_label=label,
             message=(
-                "ROS bag support needs packages: rosbags + rosbags-image. "
+                "ROS bag support needs packages: rosbags + rosbags-image.\n"
                 "Run: uv sync"
             ),
         )
@@ -898,14 +898,14 @@ def _export_bd3_or_db3(
             f"SDK playback: {rs_try.message}\n"
             "This is an Intel RealSense .db3/.bag, not a ROS Image bag "
             "(“no image topics” is expected and is not the real failure).\n"
-            "Play the Record MP4 in Library. Export needs matching librealsense "
+            "Play the Record MP4 in Library.\nExport needs matching librealsense "
             "(uv sync --extra realsense).\n"
         )
         if "version" in (rs_try.message or "").lower() or "sdk" in (rs_try.message or "").lower():
             lead += (
                 "This PC's librealsense/pyrealsense2 cannot play that file "
-                "(often recorded with a different SDK build). "
-                "Run: uv sync --extra realsense  ·  Play the Record MP4 instead. "
+                "(often recorded with a different SDK build).\n"
+                "Run: uv sync --extra realsense\nPlay the Record MP4 instead.\n"
                 "Export cannot invent frames if the SDK cannot open the .db3.\n"
             )
     elif is_ros_folder or looks_ros:

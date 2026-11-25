@@ -33,7 +33,7 @@ def show_review_prompt(
 
     bg = "#ffffff"
     ink = "#0f172a"
-    muted = "#64748b"
+    muted = "#3f4d61"
     accent = "#0f766e"
     soft = "#e2e8f0"
 

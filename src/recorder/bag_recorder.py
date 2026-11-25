@@ -207,7 +207,7 @@ def start_bag_recording(source: FrameSource, bag_path: Path) -> Path:
         import pyrealsense2 as rs  # noqa: F401
     except ImportError as exc:
         msg = (
-            "pyrealsense2 is not installed — cannot write RealSense bag. "
+            "pyrealsense2 is not installed — cannot write RealSense bag.\n"
             "Run: uv sync --extra realsense"
         )
         raise RuntimeError(msg) from exc
@@ -338,9 +338,9 @@ def start_bag_recording(source: FrameSource, bag_path: Path) -> Path:
         logger.exception("Could not restore RealSense preview after record failure")
 
     msg_0 = (
-        f"Could not start RealSense SDK recording ({Path(bag_path).name}). "
-        f"Last error: {last_exc}. "
-        "This PC's RealSense SDK may require .db3 instead of .bag (or the reverse). "
+        f"Could not start RealSense SDK recording ({Path(bag_path).name}).\n"
+        f"Last error: {last_exc}.\n"
+        "This PC's RealSense SDK may require .db3 instead of .bag (or the reverse).\n"
         "Close Intel RealSense Viewer, use USB 3, then Record again."
     )
     raise RuntimeError(msg_0)

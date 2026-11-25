@@ -9,6 +9,7 @@ This module spawns ``ffmpeg -f dshow`` and reads raw frames from stdout (NV12 at
 import contextlib
 import logging
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from recorder.config import settings
+from recorder.config import recording_settings_for, settings
 from recorder.frame_layout import (
     frame_bytes,
     pipe_pix_fmt_for_fps,
@@ -26,6 +27,10 @@ from recorder.frame_layout import (
 )
 
 logger = logging.getLogger("poc1.ffmpeg_dshow")
+
+# The line that ffmpeg (libavdevice/dshow.c) writes for each frame that the real-time buffer (-rtbufsize) drops.
+# Group 1: the buffer fill in percent.
+_RTBUF_DROP = re.compile(r"real-time buffer .* \((\d+)% of size: \d+ \[rtbufsize parameter\]\)! frame dropped!")
 
 # Elgato MJPEG is an input *codec* on dshow (-vcodec mjpeg), not -pixel_format mjpeg.
 InputMode = str  # "vcodec_mjpeg" | "pixel_yuyv422" | "none"
@@ -136,7 +141,11 @@ class FfmpegDshowCaptureSource:
         self._running = False
         self.pipe_pix_fmt = pipe_pix_fmt or pipe_pix_fmt_for_fps(self.target_fps)
         self._frame_bytes = frame_bytes(self.width, self.height, self.pipe_pix_fmt)
-        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=8)
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=recording_settings_for(device_tag).ffmpeg_queue_frames)
+        self.queue_limit = self._queue.maxsize
+        # The frames that the real-time buffer dropped since the lock, and the buffer fill (%) at the last drop.
+        self.rtbuf_drops = 0
+        self.rtbuf_last_percent = 0
         self._pending: np.ndarray | None = None
         self._active_device = ""
         self._active_input_mode = ""
@@ -189,6 +198,7 @@ class FfmpegDshowCaptureSource:
                             self.pipe_pix_fmt,
                             rate,
                         )
+                        self.rtbuf_drops = 0
                         self._seek_live_edge()
                         return
                     self.stop()
@@ -206,7 +216,7 @@ class FfmpegDshowCaptureSource:
 
         msg = (
             f"ffmpeg could not lock Elgato at {self.width}x{self.height}@{want} "
-            f"(last: {last_err}). Confirm HDMI is 1080p120 and OBS is fully exited."
+            f"(last: {last_err}).\nConfirm HDMI is 1080p120 and OBS is fully exited."
         )
         raise RuntimeError(msg)
 
@@ -224,14 +234,15 @@ class FfmpegDshowCaptureSource:
             self._ffmpeg,
             "-hide_banner",
             "-loglevel",
-            "warning",
+            # "repeat" stops the merge of identical lines into "Last message repeated N times", so each drop has a line.
+            "repeat+warning",
             "-nostdin",
             "-fflags",
             "nobuffer",
             "-f",
             "dshow",
             "-rtbufsize",
-            settings.dshow_rtbufsize,
+            recording_settings_for(self.device_tag).dshow_rtbufsize,
         ]
         size_args = ["-video_size", f"{self.width}x{self.height}"]
         fps_args = ["-framerate", str(self.target_fps)]
@@ -335,6 +346,10 @@ class FfmpegDshowCaptureSource:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
                     logger.debug("ffmpeg: %s", text)
+                drop = _RTBUF_DROP.search(text)
+                if drop is not None:
+                    self.rtbuf_drops += 1
+                    self.rtbuf_last_percent = int(drop.group(1))
         except (OSError, ValueError):
             logger.warning("The ffmpeg stderr reader stopped", exc_info=True)
 
@@ -401,6 +416,10 @@ class FfmpegDshowCaptureSource:
                 return None
             frame = nxt
         return frame
+
+    # The frames in the queue between the ffmpeg reader and the capture thread, for the Record tab.
+    def queued(self) -> int:
+        return self._queue.qsize()
 
     def read(self) -> np.ndarray | None:
         if not self._running:

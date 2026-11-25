@@ -107,7 +107,7 @@ class RealSenseFrameSource:
     def start(self) -> None:
         if not realsense_available():
             msg = (
-                "pyrealsense2 is not installed. Install with: "
+                "pyrealsense2 is not installed.\nInstall with: "
                 "uv sync --extra realsense   (or pip install pyrealsense2)"
             )
             raise RuntimeError(msg)
@@ -242,5 +242,5 @@ def create_realsense_source(
         )
     if allow_simulate:
         return SimulatedRealSenseSource(width=width, height=height, target_fps=fps)
-    msg = "No RealSense device connected. Plug in the camera, or pass allow_simulate=True."
+    msg = "No RealSense device connected.\nPlug in the camera, or pass allow_simulate=True."
     raise RuntimeError(msg)

@@ -31,32 +31,32 @@ class FrameSource(Protocol):
 # Wide blocks so the barcode survives lossy H.264/MPEG-4 compression.
 _BAR_BITS = 32
 _BAR_BIT_W = 10
-_BAR_H = 20
+BAR_H = 20
 
 
 def embed_seq_barcode(frame: np.ndarray, seq: int) -> None:
     """
     Encode `seq` as a 32-bit binary barcode along the top edge.
-    Each bit is a {_BAR_BIT_W}x{_BAR_H} white (1) or black (0) block so
+    Each bit is a {_BAR_BIT_W}x{BAR_H} white (1) or black (0) block so
     verifiers can recover the index after MP4 compression without OCR.
     """
     need_w = _BAR_BITS * _BAR_BIT_W
-    if frame.shape[1] < need_w or frame.shape[0] < _BAR_H:
+    if frame.shape[1] < need_w or frame.shape[0] < BAR_H:
         return
     for bit in range(_BAR_BITS):
         on = bool((seq >> (31 - bit)) & 1)
         x0 = bit * _BAR_BIT_W
-        frame[0:_BAR_H, x0:x0 + _BAR_BIT_W, :] = 255 if on else 0
+        frame[0:BAR_H, x0:x0 + _BAR_BIT_W, :] = 255 if on else 0
 
 
 def read_seq_barcode(frame: np.ndarray) -> int | None:
     need_w = _BAR_BITS * _BAR_BIT_W
-    if frame.shape[1] < need_w or frame.shape[0] < _BAR_H:
+    if frame.shape[1] < need_w or frame.shape[0] < BAR_H:
         return None
     seq = 0
     for bit in range(_BAR_BITS):
         x0 = bit * _BAR_BIT_W
-        block = frame[2:_BAR_H - 2, x0 + 2:x0 + _BAR_BIT_W - 2]
+        block = frame[2:BAR_H - 2, x0 + 2:x0 + _BAR_BIT_W - 2]
         if block.size == 0:
             return None
         if float(block.mean()) > settings.barcode_bit_threshold:

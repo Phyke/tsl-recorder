@@ -10,9 +10,11 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import sys
 import threading
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +26,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QScrollArea,
     QStackedWidget,
     QTabWidget,
@@ -42,7 +44,7 @@ from PySide6.QtWidgets import (
 from recorder import ui_bridge
 from recorder.bag_recorder import BUILD_ID
 from recorder.cards import CameraCard
-from recorder.config import load_settings, save_settings, settings
+from recorder.config import PreviewSettings, RecordingSettings, Settings, load_settings, save_settings, settings
 from recorder.devices import (
     PreviewOpenCancelledError,
     clear_preview_cancel,
@@ -51,13 +53,14 @@ from recorder.devices import (
     too_many_1080p120,
 )
 from recorder.library import LibraryPage
-from recorder.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud
+from recorder.preview_draw import barcode_rows_on_tile, bgr_to_rgb_fill, hud_lines_for_source, overlay_hud, preview_settings_for
 from recorder.quiet import configure_app_logging, silence_opencv
 from recorder.review import show_review_prompt
 from recorder.session import CameraSlot, MultiCamSession
 from recorder.theme import (
     ACCENT,
     ACCENT_SOFT,
+    AMBER,
     BG,
     BLUE,
     BORDER,
@@ -75,6 +78,7 @@ from recorder.theme import (
     image_label,
     label,
     set_font_size,
+    set_label_colors,
     show_rgb,
     show_text,
     text_size,
@@ -90,6 +94,38 @@ from recorder.win_names import ffmpeg_available
 
 configure_app_logging()
 logger = logging.getLogger("poc1.app")
+
+# The Settings fields of each page of the Settings tab, for the Reset buttons. The Save folder is not on a page.
+_PAGE_FIELDS = {
+    "General": ("station", "camera_slots"),
+    "Interface": ("font_size",),
+    "Preview": ("preview_realsense", "preview_elgato", "preview_other"),
+    "Recording": ("recording_realsense", "recording_elgato", "recording_other"),
+}
+
+# The badge of each record phase on the Record tab (Pipeline.record_status): the text, the text color, the background.
+# Gray: no recording possible. Green: ready or saved. Red: recording. Amber: a start or a stop in progress.
+_RECORD_BADGES = {
+    "preview_off": ("Preview off", "#334155", "#e2e8f0"),
+    "not_armed": ("Not armed", "#334155", "#e2e8f0"),
+    "ready": ("Ready", "#065f46", "#d1fae5"),
+    "starting": ("Starting", "#92400e", "#fef3c7"),
+    "recording": ("● Recording", "#ffffff", "#dc2626"),
+    "stopping": ("Stopping", "#ffffff", "#d97706"),
+    "draining_mp4": ("Draining MP4", "#ffffff", "#d97706"),
+    "finishing_db3": ("Finishing .db3", "#ffffff", "#d97706"),
+    "saving": ("Saving", "#ffffff", "#d97706"),
+    "fixing_fps": ("Fixing fps", "#ffffff", "#d97706"),
+    "saved": ("Saved", "#ffffff", "#16a34a"),
+    "saved_dropped": ("Saved with drops", "#ffffff", "#ea580c"),
+    "failed": ("Failed", "#ffffff", "#7f1d1d"),
+}
+
+# The grid row of each queue line on a Record tile (Pipeline.record_queues), in the order of the frames.
+_QUEUE_ROWS = ("Real-time buffer", "ffmpeg queue", "MP4 queue", ".db3 queue", "Recorder queue")
+
+# The largest frame of each camera type (list_realsense_modes and list_uvc_modes), for the RAM note of the MP4 queue.
+_LARGEST_FRAMES = {"recording_realsense": (1280, 720), "recording_elgato": (1920, 1080), "recording_other": (1920, 1080)}
 
 
 def _ask_yes_no(parent: QWidget, title: str, text: str) -> bool:
@@ -151,6 +187,13 @@ class UnifiedApp:
         self.last_reports: dict[str, dict] = {}
         self._closing = False
         self._record_tiles: list[QLabel] = []
+        # The frame that each Record tile shows now, and the count of UI ticks.
+        self._record_tile_frames: list[np.ndarray | None] = []
+        # Each Record tile: the badge, the detail text, the queue grid, and the line of each queue (name, bar, count).
+        self._record_status_rows: list[tuple[QLabel, QLabel, QGridLayout, dict[str, tuple[QLabel, QProgressBar, QLabel]]]] = []
+        self._tick_count = 0
+        # Settings > Recording: the changes that wait for Apply, (settings key, field) -> the new value.
+        self._recording_pending: dict[tuple[str, str], object] = {}
 
         root.setWindowTitle(f"POC1 Recorder — {BUILD_ID}")
         root.resize(1240, 860)
@@ -174,6 +217,11 @@ class UnifiedApp:
         self.refresh_record_gate()
         self._wheel_filter = _WheelFilter(self)
         QApplication.instance().installEventFilter(self._wheel_filter)
+        # A precise timer: a coarse timer at 27 ms ran 32.5 times each second, not 37.
+        self._tick_timer = QTimer(self.root)
+        self._tick_timer.setSingleShot(True)
+        self._tick_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._tick_timer.timeout.connect(self._tick)
         self._tick()
 
     # ── chrome ───────────────────────────────────────────────────────────
@@ -211,13 +259,15 @@ class UnifiedApp:
         self.record_page = QWidget()
         self.library_page = QWidget()
         self.settings_page = QWidget()
-        for page in (self.setup_page, self.record_page, self.library_page, self.settings_page):
+        self.help_page = QWidget()
+        for page in (self.setup_page, self.record_page, self.library_page, self.settings_page, self.help_page):
             page.setObjectName("page")
             page.setStyleSheet(f"QWidget#page {{ background: {BG}; }}")
         self.notebook.addTab(self.setup_page, "  Setup  ")
         self.notebook.addTab(self.record_page, "  Record  ")
         self.notebook.addTab(self.library_page, "  Library  ")
         self.notebook.addTab(self.settings_page, "  Settings  ")
+        self.notebook.addTab(self.help_page, "  How to use  ")
 
         self._build_setup()
         self._build_record()
@@ -226,7 +276,65 @@ class UnifiedApp:
         library_layout.setContentsMargins(0, 0, 0, 0)
         library_layout.addWidget(self.library)
         self._build_settings()
+        self._build_help()
         self.notebook.currentChanged.connect(lambda _index: self._on_tab())
+
+    # The How to use tab: the texts that were on the Setup tab (the steps bar, the Advanced box), on the Record tab
+    # (the multi-camera rules), and in each camera card (the bag note). One sentence on each line.
+    def _build_help(self) -> None:
+        sections = (
+            (
+                "Steps",
+                (
+                    "1) Refresh cameras",
+                    "2) Pick device & configuration",
+                    "3) Check Armed on cameras to record",
+                    "4) Start preview until live",
+                    "5) Go to Record",
+                ),
+            ),
+            (
+                "Multi-camera",
+                (
+                    "Multi-cam: RealSense/webcam @30 (or @60 if the device has it) + Elgato 1080p120 together.",
+                    "Do not arm two 1080p@120 cameras.",
+                    "HDMI must be 1080p120 for true Elgato 120.",
+                ),
+            ),
+            (
+                "Also save bag with MP4",
+                (
+                    "On Record only.",
+                    "RealSense: Intel SDK .db3/.bag (USB3, close Viewer).",
+                    "Elgato: ROS2 color folder *_color (not Intel .bag).",
+                    "For true 120fps set mirrorless HDMI to 1080p120.",
+                ),
+            ),
+            (
+                "Advanced",
+                (
+                    "MP4 + optional RealSense .db3/.bag stay in the save folder.",
+                    "JSON reports and sysmon CSV go in a meta/ subfolder.",
+                    "Close RealSense Viewer before Record so Elgato is not locked.",
+                    "Library can export bags to MP4.",
+                ),
+            ),
+        )
+        page, page_layout = frame(None, PANEL, border=True, padx=16, pady=12)
+        for index, (title, lines) in enumerate(sections):
+            if index:
+                page_layout.addSpacing(16)
+            page_layout.addWidget(label(page, title, fg=INK, font_spec=("Segoe UI Semibold", 12)))
+            page_layout.addSpacing(6)
+            page_layout.addWidget(label(page, "\n".join(lines), fg=INK, font_spec=("Segoe UI", 10), wrap=True))
+        page_layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(page)
+        layout = QVBoxLayout(self.help_page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(scroll)
 
     # The Settings tab: a list of setting groups on the left, and the page of the selected group on the right.
     def _build_settings(self) -> None:
@@ -242,29 +350,99 @@ class UnifiedApp:
             f"QListWidget::item:selected {{ background: {ACCENT_SOFT}; color: {ACCENT}; }}"
         )
         self.settings_stack = QStackedWidget()
-        for name, rows in (("General", self._general_rows()), ("Interface", self._interface_rows())):
+        # Each list of the pages, with its field: (list, Settings field, field of a camera type or None). A reset reads it.
+        self._setting_combos: list[tuple[NoWheelComboBox, str, str | None]] = []
+        # Each page: the name, the column heads (or none), and the rows.
+        pages = (
+            ("General", (), self._general_rows()),
+            ("Interface", (), self._interface_rows()),
+            ("Preview", ("RealSense", "Elgato", "Other"), self._preview_rows()),
+            ("Recording", ("RealSense", "Elgato", "Other"), self._recording_rows()),
+        )
+        for name, heads, rows in pages:
             self.settings_list.addItem(name)
             page, page_layout = frame(None, PANEL, border=True, padx=16, pady=12)
-            page_layout.addWidget(label(page, name, fg=INK, font_spec=("Segoe UI Semibold", 12)))
+            page_layout.addLayout(self._settings_title_row(page, name))
             page_layout.addSpacing(12)
-            # One row for each setting: the name, the list of choices, and a note.
+            # One row for each setting: the name, one list of choices for each column (None: an empty cell), and a note
+            # (a text, or a label that the page changes).
             grid = QGridLayout()
             grid.setHorizontalSpacing(8)
             grid.setVerticalSpacing(8)
-            for index, (text, combo, note) in enumerate(rows):
+            for column, head in enumerate(heads, 1):
+                grid.addWidget(label(page, head, fg=INK, font_spec=("Segoe UI Semibold", 9)), 0, column)
+            columns = max(len(combos) for _text, combos, _note in rows)
+            for index, (text, combos, note) in enumerate(rows, 1 if heads else 0):
                 grid.addWidget(label(page, text, fg=INK), index, 0)
-                grid.addWidget(combo, index, 1)
-                grid.addWidget(label(page, note, fg=MUTED), index, 2)
-            grid.setColumnStretch(3, 1)
+                for column, combo in enumerate(combos, 1):
+                    if combo is not None:
+                        grid.addWidget(combo, index, column)
+                grid.addWidget(note if isinstance(note, QLabel) else label(page, note, fg=MUTED, wrap=True), index, columns + 1)
+            # The note column takes the free width, so a long note wraps and does not cut the other columns.
+            grid.setColumnStretch(columns + 1, 1)
             page_layout.addLayout(grid)
+            page_layout.addSpacing(16)
+            reset_row = QHBoxLayout()
+            reset_row.addWidget(button(page, "Reset this page to defaults", partial(self._reset_settings, [name]), color="#475569"))
+            reset_row.addStretch(1)
+            page_layout.addLayout(reset_row)
             page_layout.addStretch(1)
-            self.settings_stack.addWidget(page)
+            # A scroll area, so a page with 2-line notes keeps its full row heights in a short window.
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            scroll.setWidget(page)
+            self.settings_stack.addWidget(scroll)
         self.settings_list.currentRowChanged.connect(self.settings_stack.setCurrentIndex)
         self.settings_list.setCurrentRow(0)
-        row.addWidget(self.settings_list)
+        # The list of pages, and under it the button that resets all pages.
+        side = QVBoxLayout()
+        side.setSpacing(8)
+        side.addWidget(self.settings_list, 1)
+        side.addWidget(button(None, "Reset all settings to defaults", partial(self._reset_settings, list(_PAGE_FIELDS)), color="#475569"))
+        row.addLayout(side)
         row.addWidget(self.settings_stack, 1)
 
-    def _general_rows(self) -> list[tuple[str, NoWheelComboBox, str]]:
+    # The page title. The Recording changes wait for Apply, so its title row also has the Apply button and the count of
+    # the changes that wait. The button is at the top, because the page scrolls.
+    def _settings_title_row(self, page: QWidget, name: str) -> QHBoxLayout:
+        title_row = QHBoxLayout()
+        title_row.addWidget(label(page, name, fg=INK, font_spec=("Segoe UI Semibold", 12)))
+        if name == "Recording":
+            title_row.addSpacing(16)
+            self.recording_apply_btn = button(page, "Apply", self._apply_recording_settings, color=BLUE, state="disabled")
+            title_row.addWidget(self.recording_apply_btn)
+            title_row.addSpacing(12)
+            self.recording_pending_label = label(page, "", fg=AMBER)
+            title_row.addWidget(self.recording_pending_label)
+        title_row.addStretch(1)
+        return title_row
+
+    # Set the fields of the pages to their defaults, apply them, show them in the lists, and save settings.json.
+    # The Save folder of the Setup tab does not change.
+    def _reset_settings(self, pages: list[str]) -> None:
+        what = f"the {pages[0]} settings" if len(pages) == 1 else "all the settings of the Settings tab"
+        if not _ask_yes_no(self.root, "Reset to defaults", f"Reset {what} to the defaults?"):
+            return
+        for page in pages:
+            for field in _PAGE_FIELDS[page]:
+                default = Settings.model_fields[field].get_default(call_default_factory=True)
+                if page == "Recording":
+                    self._pend_recording_defaults(field, default)
+                else:
+                    setattr(settings, field, default)
+        if "General" in pages:
+            self.session.station = settings.station
+        if "Interface" in pages:
+            set_font_size(QApplication.instance(), settings.font_size)
+        for combo, key, field in self._setting_combos:
+            combo.setCurrentIndex(combo.findData(self._shown_setting(key, field)))
+        self._update_queue_notes()
+        self._refresh_recording_apply()
+        if self.settings_path is not None:
+            save_settings(self.settings_path)
+
+    def _general_rows(self) -> list[tuple[str, list[NoWheelComboBox], str]]:
         self.station_combo = NoWheelComboBox()
         self.station_combo.setMinimumContentsLength(10)
         self.station_combo.addItem("Not set", "")
@@ -278,21 +456,229 @@ class UnifiedApp:
             self.slots_combo.addItem(str(count), count)
         self.slots_combo.setCurrentIndex(self.slots_combo.findData(settings.camera_slots))
         self.slots_combo.activated.connect(lambda index: self._save_setting("camera_slots", self.slots_combo.itemData(index)))
+        self._setting_combos += [(self.station_combo, "station", None), (self.slots_combo, "camera_slots", None)]
         return [
-            ("Station", self.station_combo, "Written into each recording report."),
-            ("Camera slots at start", self.slots_combo, "Applies at the next start."),
+            ("Station", [self.station_combo], "Written into each recording report."),
+            ("Camera slots at start", [self.slots_combo], "Applies at the next start."),
         ]
 
     # The font size of the whole app, in points of the base text. A size picked from the list applies at once.
     # A list and not a spin box: a font change moves the whole page, so spin box arrows move away from the mouse after each click.
-    def _interface_rows(self) -> list[tuple[str, NoWheelComboBox, str]]:
+    def _interface_rows(self) -> list[tuple[str, list[NoWheelComboBox], str]]:
         self.font_size_combo = NoWheelComboBox()
         self.font_size_combo.setMinimumContentsLength(6)
         for size in range(settings.font_size_range[0], settings.font_size_range[1] + 1):
             self.font_size_combo.addItem(f"{size} pt", size)
         self.font_size_combo.setCurrentIndex(self.font_size_combo.findData(font_size()))
         self.font_size_combo.activated.connect(lambda index: self._set_font_size(self.font_size_combo.itemData(index)))
-        return [("Font size", self.font_size_combo, "")]
+        self._setting_combos.append((self.font_size_combo, "font_size", None))
+        return [("Font size", [self.font_size_combo], "")]
+
+    # The preview settings of each camera type: one row for each setting, one column for each type.
+    # A change applies at the next preview frame.
+    def _preview_rows(self) -> list[tuple[str, list[NoWheelComboBox], str]]:
+        fields = (
+            ("Preview fps", "fps", [(f"{fps} fps", fps) for fps in PreviewSettings.fps_choices], "Preview frames each second."),
+            (
+                "Preview resolution",
+                "scale_percent",
+                [(f"x{percent / 100:g}", percent) for percent in PreviewSettings.scale_choices],
+                "The preview copy, as a part of the camera frame size.",
+            ),
+            ("HUD font size", "font_px", [(f"{px} px", px) for px in PreviewSettings.font_px_choices], "The height of one HUD text line."),
+            ("HUD color", "color", [(color.capitalize(), color) for color in PreviewSettings.hud_colors], "The color of the HUD text."),
+        )
+        rows = []
+        for text, field, choices, note in fields:
+            combos = []
+            for key in ("preview_realsense", "preview_elgato", "preview_other"):
+                combo = NoWheelComboBox()
+                combo.setMinimumContentsLength(7)
+                for choice_text, value in choices:
+                    combo.addItem(choice_text, value)
+                combo.setCurrentIndex(combo.findData(getattr(getattr(settings, key), field)))
+                combo.activated.connect(partial(self._set_preview_setting, key, field, combo))
+                combos.append(combo)
+                self._setting_combos.append((combo, key, field))
+            rows.append((text, combos, note))
+        return rows
+
+    def _set_preview_setting(self, key: str, field: str, combo: NoWheelComboBox, index: int) -> None:
+        setattr(getattr(settings, key), field, combo.itemData(index))
+        if self.settings_path is not None:
+            save_settings(self.settings_path)
+
+    # The recording settings of each camera type: one row for each setting, one column for each type.
+    # A row has a list only in the columns of the camera types that use the setting.
+    def _recording_rows(self) -> list[tuple[str, list[NoWheelComboBox | None], str | QLabel]]:
+        keys = ("recording_realsense", "recording_elgato", "recording_other")
+        all_types = set(keys)
+        uvc = {"recording_elgato", "recording_other"}
+        elgato = {"recording_elgato"}
+        rec = RecordingSettings
+        queue_items = [(str(frames), frames) for frames in rec.queue_choices]
+        buffer_items = [(str(frames), frames) for frames in rec.buffer_choices]
+        drain_items = [(f"{seconds} s", seconds) for seconds in rec.drain_s_choices]
+        start_note = "Next Start preview."
+        record_note = "Next Record."
+        # A None note: the RAM note of an MP4 queue row (see _update_queue_notes).
+        fields = (
+            ("MP4 queue (frames)", "mp4_queue_frames", queue_items, all_types, None),
+            ("MP4 queue, deep rate (frames)", "mp4_queue_frames_deep", queue_items, all_types, None),
+            (
+                "Deep rate from",
+                "deep_buffer_fps",
+                [(f"{fps} fps", fps) for fps in rec.deep_fps_choices],
+                all_types,
+                f"The deep queue and the deep driver buffer apply at this fps or more.\n{start_note}",
+            ),
+            ("Driver buffer (frames)", "driver_buffer_frames", buffer_items, uvc, f"The OpenCV camera buffer.\n{start_note}"),
+            ("Driver buffer, deep rate (frames)", "driver_buffer_frames_deep", buffer_items, uvc, start_note),
+            (
+                "OBS-pin driver buffer (frames)",
+                "obs_pin_buffer_frames",
+                buffer_items,
+                elgato,
+                f"The Elgato open at {settings.high_rate_fps} fps or more.\n{start_note}",
+            ),
+            (
+                "ffmpeg input buffer",
+                "dshow_rtbufsize",
+                [(size, size) for size in rec.rtbufsize_choices],
+                elgato,
+                f"ffmpeg -rtbufsize.\n150M delayed the preview by 1 to 3 s.\n{start_note}",
+            ),
+            (
+                "ffmpeg frame queue (frames)",
+                "ffmpeg_queue_frames",
+                [(str(frames), frames) for frames in rec.ffmpeg_queue_choices],
+                elgato,
+                f"Frames between ffmpeg and Python.\n{start_note}",
+            ),
+            (".db3 queue (frames)", "db3_queue_frames", queue_items, elgato, f"JPEG frames that wait for the .db3 write.\n{record_note}"),
+            (".db3 JPEG quality", "db3_jpeg_quality", [(str(q), q) for q in rec.jpeg_quality_choices], elgato, record_note),
+            (".db3 drain limit at Stop", "db3_drain_s", drain_items, elgato, record_note),
+            (
+                "MP4 drain limit at Stop",
+                "mp4_drain_s",
+                drain_items,
+                all_types,
+                f"The frames still in the queue after this time are lost.\n{record_note}",
+            ),
+            (
+                "MP4 codec",
+                "mp4_codec",
+                [("Auto", "auto"), ("mp4v", "mp4v")],
+                all_types,
+                f"Auto: H.264 when the OpenH264 DLL is present, else mp4v.\n{record_note}",
+            ),
+            (
+                "System monitor interval",
+                "monitor_interval_ms",
+                [(f"{ms} ms", ms) for ms in rec.monitor_ms_choices],
+                all_types,
+                f"CPU, RAM and disk samples in the monitor CSV.\n{record_note}",
+            ),
+        )
+        # The fields that apply at the next Start preview: a change to one of them makes Apply stop the previews.
+        self._recording_restart_fields = {
+            field for _text, field, _choices, _used_by, note in fields if note is None or note.endswith(start_note)
+        }
+        self._queue_notes: dict[str, QLabel] = {}
+        rows: list[tuple[str, list[NoWheelComboBox | None], str | QLabel]] = []
+        for text, field, choices, used_by, note in fields:
+            combos: list[NoWheelComboBox | None] = []
+            for key in keys:
+                if key not in used_by:
+                    combos.append(None)
+                    continue
+                combo = NoWheelComboBox()
+                combo.setMinimumContentsLength(7)
+                for choice_text, value in choices:
+                    combo.addItem(choice_text, value)
+                combo.setCurrentIndex(combo.findData(getattr(getattr(settings, key), field)))
+                combo.activated.connect(partial(self._set_recording_setting, key, field, combo))
+                combos.append(combo)
+                self._setting_combos.append((combo, key, field))
+            note_widget: str | QLabel = note if note is not None else label(None, "", fg=MUTED, wrap=True)
+            if note is None:
+                self._queue_notes[field] = note_widget
+            rows.append((text, combos, note_widget))
+        self._update_queue_notes()
+        return rows
+
+    # A change on the Recording page waits for Apply. A value that is the same as the current setting does not wait.
+    def _set_recording_setting(self, key: str, field: str, combo: NoWheelComboBox, index: int) -> None:
+        value = combo.itemData(index)
+        if value == getattr(getattr(settings, key), field):
+            self._recording_pending.pop((key, field), None)
+        else:
+            self._recording_pending[(key, field)] = value
+        self._update_queue_notes()
+        self._refresh_recording_apply()
+
+    # The value that the Recording page shows: the change that waits for Apply, else the current setting.
+    def _recording_value(self, key: str, field: str) -> object:
+        return self._recording_pending.get((key, field), getattr(getattr(settings, key), field))
+
+    # The value that a list of a Settings page shows. The Recording lists show the changes that wait for Apply.
+    def _shown_setting(self, key: str, field: str | None) -> object:
+        if field is None:
+            return getattr(settings, key)
+        if key in _PAGE_FIELDS["Recording"]:
+            return self._recording_value(key, field)
+        return getattr(getattr(settings, key), field)
+
+    # A reset of the Recording page waits for Apply: each default that is not the current value becomes a change that waits.
+    def _pend_recording_defaults(self, key: str, default: RecordingSettings) -> None:
+        current = getattr(settings, key)
+        for field in type(default).model_fields:
+            value = getattr(default, field)
+            if value == getattr(current, field):
+                self._recording_pending.pop((key, field), None)
+            else:
+                self._recording_pending[(key, field)] = value
+
+    # Apply is on when changes wait and no preview starts and no recording runs.
+    def _refresh_recording_apply(self, *, blocked: bool | None = None) -> None:
+        if blocked is None:
+            blocked = self.busy or self.session.is_recording
+        count = len(self._recording_pending)
+        self.recording_apply_btn.setEnabled(count > 0 and not blocked)
+        lines = [f"{count} change(s) wait for Apply."] if count else []
+        if count and blocked:
+            lines.append("Apply is off while a preview starts or a recording runs.")
+        self.recording_pending_label.setText("\n".join(lines))
+
+    # Write the changes that wait and save settings.json.
+    # When a change applies at the next Start preview, stop all running previews, and tell the user to start them again.
+    def _apply_recording_settings(self) -> None:
+        if not self._recording_pending or self.busy or self.session.is_recording:
+            return
+        restart = any(field in self._recording_restart_fields for _key, field in self._recording_pending)
+        for (key, field), value in self._recording_pending.items():
+            setattr(getattr(settings, key), field, value)
+        self._recording_pending.clear()
+        if self.settings_path is not None:
+            save_settings(self.settings_path)
+        self._update_queue_notes()
+        self._refresh_recording_apply()
+        if restart and self.session.previews_running:
+            self.stop_all_previews()
+            self.set_status("Recording settings applied, and all previews stopped.\nStart each preview again on the Setup tab.")
+        elif restart:
+            self.set_status("Recording settings applied.\nThey take effect at the next Start preview.")
+        else:
+            self.set_status("Recording settings applied.\nThey take effect at the next Record.")
+
+    # The RAM of a full MP4 queue for each camera type: the frames x the largest frame in BGR (3 bytes a pixel).
+    def _update_queue_notes(self) -> None:
+        for field, note in self._queue_notes.items():
+            sizes = [
+                f"{self._recording_value(key, field) * width * height * 3 / 1e9:.1f}"
+                for key, (width, height) in _LARGEST_FRAMES.items()
+            ]
+            note.setText(f"A full queue uses {' · '.join(sizes)} GB of RAM (BGR, largest mode).\nNext Start preview.")
 
     def _set_station(self, station: str) -> None:
         self.session.station = station
@@ -321,19 +707,6 @@ class UnifiedApp:
         page.setContentsMargins(0, 0, 0, 0)
         page.setSpacing(0)
 
-        tip, tip_layout = frame(None, ACCENT_SOFT, padx=16, pady=10)
-        tip_layout.addWidget(
-            label(
-                tip,
-                "1) Refresh cameras  ·  2) Pick device & configuration  ·  "
-                "3) Check Armed on cameras to record  ·  "
-                "4) Start preview until live  ·  5) Go to Record",
-                fg=ACCENT,
-                font_spec=("Segoe UI", 9),
-            )
-        )
-        page.addWidget(_margin(tip, 4, 4, 4, 0))
-
         folder, folder_row = frame(None, BG, padx=8, pady=10, kind="h")
         page.addWidget(folder)
         folder_row.addWidget(label(folder, "Save folder", fg=MUTED, font_spec=("Segoe UI Semibold", 9)))
@@ -360,24 +733,6 @@ class UnifiedApp:
         toolbar_row.addWidget(self.stop_all_btn)
         toolbar_row.addStretch(1)
 
-        adv = QGroupBox(" Advanced ")
-        adv.setFont(font(("Segoe UI", 9)))
-        adv_layout = QVBoxLayout(adv)
-        adv_layout.setContentsMargins(8, 8, 8, 8)
-        adv_layout.addWidget(
-            label(
-                adv,
-                "MP4 + optional RealSense .db3/.bag stay in the save folder. "
-                "JSON reports and sysmon CSV go in a meta/ subfolder. "
-                "Close RealSense Viewer before Record so Elgato is not locked. "
-                "Library can export bags to MP4.",
-                fg=MUTED,
-                font_spec=("Segoe UI", 8),
-                wrap=True,
-            )
-        )
-        page.addWidget(_margin(adv, 8, 4, 8, 0))
-
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -400,21 +755,6 @@ class UnifiedApp:
         page = QVBoxLayout(self.record_page)
         page.setContentsMargins(0, 0, 0, 0)
         page.setSpacing(0)
-
-        tip, tip_layout = frame(None, SURFACE, padx=16, pady=10)
-        tip_layout.addWidget(
-            label(
-                tip,
-                "Multi-cam: RealSense/webcam @30 (or @60 if the device has it) + Elgato 1080p120 together. "
-                "Do not arm two 1080p@120 cameras. HDMI must be 1080p120 for true Elgato 120.",
-                fg=INK,
-                font_spec=("Segoe UI Semibold", 9),
-                wrap=True,
-            )
-        )
-        self.record_tip_label = label(tip, "", fg=MUTED, font_spec=("Segoe UI", 9), wrap=True)
-        tip_layout.addWidget(self.record_tip_label)
-        page.addWidget(_margin(tip, 4, 4, 4, 0))
 
         actions, actions_row = frame(None, BG, padx=8, pady=12, kind="h")
         page.addWidget(actions)
@@ -440,7 +780,12 @@ class UnifiedApp:
             state="disabled",
         )
         actions_row.addWidget(self.stop_record_btn)
-        actions_row.addStretch(1)
+        # The Record check text (refresh_record_gate), in the space between Stop and Last report. Each issue has its own
+        # line, and a long line wraps.
+        actions_row.addSpacing(16)
+        self.record_tip_label = label(actions, "", fg=MUTED, font_spec=("Segoe UI", 9), wrap=True)
+        actions_row.addWidget(self.record_tip_label, 1)
+        actions_row.addSpacing(16)
         actions_row.addWidget(button(actions, "Last report", self.show_report, color="#475569"))
         actions_row.addSpacing(6)
         actions_row.addWidget(button(actions, "Open save folder", self.open_output_folder, color="#475569"))
@@ -456,8 +801,11 @@ class UnifiedApp:
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
 
-    def _set_record_tip(self, text: str) -> None:
+    def _set_record_tip(self, text: str, fg: str = MUTED) -> None:
         self.record_tip_label.setText(text)
+        if self.record_tip_label.property("tip_color") != fg:
+            self.record_tip_label.setProperty("tip_color", fg)
+            set_label_colors(self.record_tip_label, fg)
 
     def show_library(self, path: Path | None = None) -> None:
         self.notebook.setCurrentWidget(self.library_page)
@@ -531,7 +879,7 @@ class UnifiedApp:
         if self.busy:
             return
         if self.session.previews_running:
-            if not _ask_yes_no(self.root, "Refresh cameras", "This stops all previews. Continue?"):
+            if not _ask_yes_no(self.root, "Refresh cameras", "This stops all previews.\nContinue?"):
                 return
             self.session.stop_previews()
         self._set_busy(busy=True)
@@ -579,14 +927,14 @@ class UnifiedApp:
         summary = ", ".join(parts) or "none yet"
         names = ", ".join(d.name for d in real[:4]) or "none yet"
         status = (
-            f"Found {len(real)} camera(s) ({summary}): {names}. "
+            f"Found {len(real)} camera(s) ({summary}): {names}.\n"
             "Start preview on each camera you plan to record."
         )
         if elg_n and sys.platform == "win32":
             try:
                 if not ffmpeg_available():
                     status += (
-                        " Warning: ffmpeg missing — Elgato open may fail; "
+                        "\nWarning: ffmpeg missing — Elgato open may fail; "
                         "install ffmpeg on PATH, then Refresh."
                     )
             except Exception:
@@ -723,19 +1071,19 @@ class UnifiedApp:
             msg = f"{live} preview(s) showing video"
             if waiting > 0:
                 msg += f" ({waiting} opened but no frames yet)"
-            self.set_status(f"{msg}. Some failed.")
+            self.set_status(f"{msg}.\nSome failed.")
             QMessageBox.critical(
                 self.root,
                 "Preview",
                 error + "\n\nClose Zoom/Teams/Camera, Elgato 4K Capture Utility, "
-                "and extra POC1 windows. For Elgato: HDMI ON, install ffmpeg, "
+                "and extra POC1 windows.\nFor Elgato: HDMI ON, install ffmpeg, "
                 "Refresh, then try Camera 2 Start preview alone.",
             )
         else:
             msg = f"{live} preview(s) showing video"
             if waiting > 0:
                 msg += f" ({waiting} opened but no frames yet — wait or restart preview)"
-            self.set_status(f"{msg}. Open Record when ready.")
+            self.set_status(f"{msg}.\nOpen Record when ready.")
         self.refresh_record_gate()
 
     def _slot_preview_started(
@@ -796,7 +1144,7 @@ class UnifiedApp:
         QMessageBox.warning(
             self.root,
             f"Camera {slot_id + 1}",
-            "Opened, but no image yet. Close other camera apps, check the webcam, "
+            "Opened, but no image yet.\nClose other camera apps, check the webcam, "
             "then Start preview again.",
         )
 
@@ -868,18 +1216,45 @@ class UnifiedApp:
                 "Too many 1080p@120 cameras",
                 "Only one 1920x1080@90+ camera per Record.\n"
                 f"Currently: {', '.join(high)}.\n\n"
-                "Keep Elgato (or fake) 1080p120, and set the others to @30 or @60. "
+                "Keep Elgato (or fake) 1080p120, and set the others to @30 or @60.\n"
                 "Webcam + fake 1080p120 together drops frames.",
             )
             return False
         return True
 
+    # The automatic Record check: the armed cameras and their live preview, then 2 camera rules. Only one 1920x1080 camera
+    # at 90 fps or more per take (red, Record off). An Elgato that asked for 90 fps or more but delivers less than 85 %
+    # of it, because the HDMI signal is not 1080p120 (amber, Record stays on).
     def refresh_record_gate(self) -> None:
         if self.busy or self.session.is_recording:
             return
         ok, tip = self._armed_live_ready()
-        self._set_record_tip(tip)
+        fg = MUTED
+        armed = [s for s in self.session.slots if s.armed]
+        if too_many_1080p120([s.mode for s in armed]):
+            high = [s.prefix for s in armed if is_fhd_high_rate(s.mode)]
+            ok, fg = False, RED
+            tip = (
+                f"Too many 1080p@120 cameras ({', '.join(high)}): only one 1920x1080 camera at 90 fps or more can record.\n"
+                "Set the others to @30 or @60 on Setup."
+            )
+        elif ok and (low := self._elgato_not_120_lines()):
+            fg = AMBER
+            tip = "\n".join([tip, *low])
+        self._set_record_tip(tip, fg)
         self.record_btn.setEnabled(ok)
+
+    def _elgato_not_120_lines(self) -> list[str]:
+        lines: list[str] = []
+        for slot in self.session.slots:
+            src = slot.pipeline.source if slot.armed and slot.pipeline is not None else None
+            if getattr(src, "device_tag", "") != "elgato":
+                continue
+            measured = float(getattr(src, "actual_fps", 0) or 0)
+            requested = int(getattr(src, "requested_fps", 0) or getattr(src, "target_fps", 0) or 0)
+            if measured >= 1 and requested >= settings.high_rate_fps and measured < requested * 0.85:
+                lines.append(f"{slot.prefix} delivers ~{measured:.0f} fps, not {requested}: set the HDMI source to 1080p120")
+        return lines
 
     def _rebuild_record_tiles(self) -> None:
         while self.record_grid_layout.count():
@@ -889,8 +1264,12 @@ class UnifiedApp:
                 widget.setParent(None)
                 widget.deleteLater()
         self._record_tiles = []
+        self._record_status_rows = []
         slots = self.session.slots
         cols = 2 if len(slots) > 1 else 1
+        # QGridLayout keeps its old rows. An old row with stretch takes height when it is empty.
+        for row in range(self.record_grid_layout.rowCount()):
+            self.record_grid_layout.setRowStretch(row, 0)
         for col in range(cols):
             self.record_grid_layout.setColumnStretch(col, 1)
         for index, slot in enumerate(slots):
@@ -908,17 +1287,104 @@ class UnifiedApp:
                 pady=6,
             )
             cell_layout.addWidget(title)
+            # The status row: a colored badge and the detail text. Under it, one line for each queue of the camera.
+            status_box, status_layout = frame(cell, PANEL, padx=10, pady=4)
+            top_box, top_row = frame(status_box, PANEL, kind="h")
+            badge = label(top_box, "", font_spec=("Segoe UI Semibold", 10), padx=10, pady=3)
+            detail = label(top_box, "", fg=INK, font_spec=("Segoe UI", 10))
+            top_row.addWidget(badge)
+            top_row.addSpacing(10)
+            top_row.addWidget(detail, 1)
+            queue_box = QWidget(status_box)
+            queue_grid = QGridLayout(queue_box)
+            queue_grid.setContentsMargins(0, 4, 0, 0)
+            queue_grid.setHorizontalSpacing(10)
+            queue_grid.setVerticalSpacing(2)
+            queue_grid.setColumnStretch(3, 1)
+            status_layout.addWidget(top_box)
+            status_layout.addWidget(queue_box)
+            cell_layout.addWidget(status_box)
+            self._record_status_rows.append((badge, detail, queue_grid, {}))
             tile = image_label(cell, "No preview")
             cell_layout.addWidget(_margin(tile, 4, 0, 4, 4), 1)
             self._record_tiles.append(tile)
+        self._record_tile_frames = [None] * len(self._record_tiles)
+        self._tick_record_status()
 
-    def _tick_record_tiles(self) -> None:
+    # The recording status row of each camera on the Record tab (Pipeline.record_status), at each full tick.
+    # A widget changes only when its value changes.
+    def _tick_record_status(self) -> None:
+        if len(self._record_status_rows) != len(self.session.slots):
+            return
+        for slot, (badge, detail, queue_grid, queue_rows) in zip(self.session.slots, self._record_status_rows, strict=False):
+            queues: list[tuple[str, float | None, str]] = []
+            if slot.pipeline is None:
+                phase, text = "preview_off", "Start the preview on the Setup tab"
+            else:
+                phase, text, queues = slot.pipeline.record_status()
+                if not phase:
+                    phase, text = ("ready", "Press Record to start") if slot.armed else ("not_armed", "This camera does not record")
+            badge_text, fg, bg = _RECORD_BADGES[phase]
+            if badge.text() != badge_text:
+                badge.setText(badge_text)
+                set_label_colors(badge, fg, bg, padx=10, pady=3)
+            if detail.text() != text:
+                detail.setText(text)
+            self._show_queue_rows(queue_grid, queue_rows, queues)
+
+    # One line for each queue: the name, the fill bar (none for the real-time buffer), and the count. A line is made the
+    # first time its queue shows, and hidden while the queue is not there.
+    @staticmethod
+    def _show_queue_rows(
+        grid: QGridLayout, rows: dict[str, tuple[QLabel, QProgressBar, QLabel]], queues: list[tuple[str, float | None, str]]
+    ) -> None:
+        box = grid.parentWidget()
+        shown = {queue[0] for queue in queues}
+        for name, (name_label, bar, count) in rows.items():
+            if name_label.isVisibleTo(box) != (name in shown):
+                name_label.setVisible(name in shown)
+                count.setVisible(name in shown)
+                if name not in shown:
+                    bar.hide()
+        for name, fill, text in queues:
+            if name not in rows:
+                bar = QProgressBar(box)
+                bar.setRange(0, 1000)
+                bar.setTextVisible(False)
+                bar.setFixedSize(180, 10)
+                rows[name] = (label(box, name, fg=INK, font_spec=("Segoe UI", 10)), bar, label(box, "", fg=INK, font_spec=("Segoe UI", 10)))
+                row = _QUEUE_ROWS.index(name)
+                grid.addWidget(rows[name][0], row, 0)
+                grid.addWidget(bar, row, 1, Qt.AlignmentFlag.AlignVCenter)
+                grid.addWidget(rows[name][2], row, 2)
+            _name_label, bar, count = rows[name]
+            if count.text() != text:
+                count.setText(text)
+            if bar.isVisibleTo(box) != (fill is not None):
+                bar.setVisible(fill is not None)
+            if fill is None:
+                continue
+            bar.setValue(round(min(fill, 1.0) * 1000))
+            # Green below half full, amber below 90 %, red from 90 %.
+            color = "#16a34a" if fill < 0.5 else "#d97706" if fill < 0.9 else "#dc2626"  # noqa: PLR2004
+            if bar.property("chunk_color") != color:
+                bar.setProperty("chunk_color", color)
+                bar.setStyleSheet(
+                    f"QProgressBar {{ background: #e2e8f0; border: 1px solid {BORDER}; border-radius: 3px; }}"
+                    f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
+                )
+
+    # Between the full ticks, a tile is drawn only for a new frame.
+    def _tick_record_tiles(self, *, full: bool = True) -> None:
         if len(self._record_tiles) != len(self.session.slots):
             return
-        for slot, tile in zip(self.session.slots, self._record_tiles, strict=False):
+        for index, (slot, tile) in enumerate(zip(self.session.slots, self._record_tiles, strict=False)):
             frame_bgr = slot.get_preview_frame()
             if frame_bgr is None:
                 continue
+            if not full and frame_bgr is self._record_tile_frames[index]:
+                continue
+            self._record_tile_frames[index] = frame_bgr
             tw = tile.width()
             th = tile.height()
             if tw < settings.min_tile_px or th < settings.min_tile_px:
@@ -940,7 +1406,9 @@ class UnifiedApp:
                 logger.exception("record tile draw failed")
                 continue
             if src is not None:
-                rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
+                prefs = preview_settings_for(slot.camera)
+                top = barcode_rows_on_tile(frame_bgr, prefs.scale_percent, tw, th)
+                rgb = overlay_hud(rgb, hud_lines_for_source(slot, src), prefs, top)
             show_rgb(tile, rgb)
 
     # ── recording ────────────────────────────────────────────────────────
@@ -953,6 +1421,7 @@ class UnifiedApp:
             if not busy and not recording:
                 card.restore_bag_checkbox()
         enabled = not (busy or recording)
+        self._refresh_recording_apply(blocked=busy or recording)
         for btn in (
             self.refresh_btn,
             self.add_btn,
@@ -1024,7 +1493,7 @@ class UnifiedApp:
                 bits.append(f"RealSense .db3/.bag: {', '.join(rs_bag)}")
             if elgato_bag:
                 bits.append(f"Elgato ROS2 *_color: {', '.join(elgato_bag)}")
-            self.set_status("Recording with " + " · ".join(bits))
+            self.set_status("\n".join(["Recording with:", *bits]))
 
         armed = [s for s in self.session.slots if s.armed]
         heavy = [
@@ -1068,7 +1537,7 @@ class UnifiedApp:
         extra = self._elgato_live_lines()
         tip = f"Recording {n} camera(s)…"
         if extra:
-            tip += "  " + "  ·  ".join(extra)
+            tip = "\n".join([tip, *extra])
         self._set_record_tip(tip)
         bags = [
             s
@@ -1085,7 +1554,7 @@ class UnifiedApp:
                 else:
                     bits.append(s.prefix)
             self.set_status(
-                f"Recording — bag ON for {', '.join(bits)}. Press Stop when finished."
+                f"Recording — bag ON for {', '.join(bits)}.\nPress Stop when finished."
             )
         else:
             self.set_status("Recording — press Stop when finished.")
@@ -1155,7 +1624,7 @@ class UnifiedApp:
         status = (
             "Saved cleanly — no frame drops."
             if ok
-            else "Saved. Check Last report if something looks off."
+            else "Saved.\nCheck Last report if something looks off."
         )
         hdmi = [r for r in valid if r.get("hdmi_not_120hz")]
         if hdmi:
@@ -1165,11 +1634,11 @@ class UnifiedApp:
                 meas = float(report.get("measured_fps") or 0)
                 stamp = report.get("container_fps")
                 bits.append(capture_not_120_status(req, meas, stamp))
-            status += " " + "; ".join(bits) + "."
+            status += "".join(f"\n{bit}." for bit in bits)
         if any(r.get("r7_120_ok") for r in valid):
-            status += " Elgato ~120 with no software drops."
+            status += "\nElgato ~120 with no software drops."
         if bag_ok:
-            status += f" .bag saved: {', '.join(p for p, _ in bag_ok)}."
+            status += f"\n.bag saved: {', '.join(p for p, _ in bag_ok)}."
         bag_drops = [
             (prefix, int(r.get("bag_dropped") or 0))
             for prefix, r in reports.items()
@@ -1177,12 +1646,12 @@ class UnifiedApp:
         ]
         if bag_drops:
             status += (
-                " Elgato ROS2 bag queue dropped frames: "
+                "\nElgato ROS2 bag queue dropped frames: "
                 + ", ".join(f"{p} x{n}" for p, n in bag_drops)
                 + " (MP4 path separate)."
             )
         self.set_status(status)
-        self._set_record_tip("Recording stopped. Arm cameras and start previews to record again.")
+        self._set_record_tip("Recording stopped.\nArm cameras and start previews to record again.")
         if bag_missing:
             QMessageBox.critical(
                 self.root,
@@ -1266,7 +1735,7 @@ class UnifiedApp:
                     "Some frames were skipped",
                     "Encode could not keep up (read ≠ written) on:\n\n"
                     + "\n".join(drop_notes)
-                    + "\n\nHDMI ~60 is not this error. Keep companions at @30/@60; "
+                    + "\n\nHDMI ~60 is not this error.\nKeep companions at @30/@60; "
                     "only one 1080p@120 (Elgato) per take.",
                 )
 
@@ -1320,7 +1789,7 @@ class UnifiedApp:
             QMessageBox.information(
                 self.root,
                 "Speed fixed",
-                "Playback timing was updated in the background. Frame count unchanged.",
+                "Playback timing was updated in the background.\nFrame count unchanged.",
             )
         self.set_status("Ready.")
 
@@ -1405,28 +1874,43 @@ class UnifiedApp:
     def _tick(self) -> None:
         if self._closing:
             return
+        # The timer runs at the highest Preview fps, in equal parts of settings.ui_tick_ms.
+        # A full tick (one in each settings.ui_tick_ms) also updates the status labels and the HUD.
+        top_fps = max(settings.preview_elgato.fps, settings.preview_realsense.fps, settings.preview_other.fps)
+        parts = max(1, math.ceil(settings.ui_tick_ms * top_fps / 1000))
+        full = self._tick_count % parts == 0
+        self._tick_count += 1
         page = self.notebook.currentWidget()
         # Only redraw the visible page — Setup+Record both converting HD frames
         # was freezing Tk ("Not Responding").
         if page is self.setup_page:
             for card in self.cards:
                 try:
-                    card.tick()
+                    card.tick(full=full)
                 except Exception:
                     logger.exception("preview tick failed for slot %s", getattr(card, "slot_id", "?"))
         elif page is self.record_page:
-            try:
-                self._tick_record_tiles()
-            except Exception:
-                logger.exception("record preview tick failed")
-            if self.session.is_recording:
-                extra = self._elgato_live_lines()
-                if extra:
-                    self._set_record_tip("Recording…  " + "  ·  ".join(extra))
-            elif not self.busy:
-                self.refresh_record_gate()
-        delay_ms = 80
-        QTimer.singleShot(delay_ms, self.root, self._tick)
+            self._tick_record_page(full=full)
+        self._tick_timer.start(round(settings.ui_tick_ms / parts))
+
+    # The Record tab: the tiles at each tick; the status lines, the tip and the Record button at each full tick.
+    def _tick_record_page(self, *, full: bool) -> None:
+        try:
+            self._tick_record_tiles(full=full)
+        except Exception:
+            logger.exception("record preview tick failed")
+        if not full:
+            return
+        try:
+            self._tick_record_status()
+        except Exception:
+            logger.exception("record status tick failed")
+        if self.session.is_recording:
+            extra = self._elgato_live_lines()
+            if extra:
+                self._set_record_tip("\n".join(["Recording…", *extra]))
+        elif not self.busy:
+            self.refresh_record_gate()
 
     def _on_close(self) -> bool:
         if self.busy and self.session.is_recording:
@@ -1437,7 +1921,7 @@ class UnifiedApp:
             QMessageBox.warning(
                 self.root,
                 "Please wait",
-                "A camera is still opening. Stop was requested. "
+                "A camera is still opening.\nStop was requested.\n"
                 "Wait until the preview clears, then close.",
             )
             return False

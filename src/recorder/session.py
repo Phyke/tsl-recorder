@@ -30,7 +30,7 @@ from recorder.devices import (
     preview_cancel_requested,
 )
 from recorder.pipeline import Pipeline
-from recorder.preview_draw import colorize_depth_preview, downscale_for_preview
+from recorder.preview_draw import colorize_depth_preview, downscale_for_preview, preview_settings_for
 
 logger = logging.getLogger("poc1.d1.session")
 
@@ -64,18 +64,19 @@ class CameraSlot:
     def on_preview(self, env: FrameEnvelope) -> None:
         # Preview is display-only. Do not copy full 1080p@120 onto the UI path.
         now = time.monotonic()
-        min_dt = 1.0 / settings.preview_hz
+        prefs = preview_settings_for(self.camera)
+        min_dt = 1.0 / prefs.fps
         if now - self._preview_draw_t < min_dt:
             return
         if env.frame is None:
             return
-        small = downscale_for_preview(env.frame)
+        small = downscale_for_preview(env.frame, prefs.scale_percent)
         depth = None
         src = self.pipeline.source if self.pipeline is not None else None
         raw_depth = getattr(src, "_depth_raw", None) if src is not None else None
         if raw_depth is not None:
             try:
-                depth = downscale_for_preview(colorize_depth_preview(np.array(raw_depth, copy=True)))
+                depth = downscale_for_preview(colorize_depth_preview(np.array(raw_depth, copy=True)), prefs.scale_percent)
             except Exception:  # noqa: BLE001
                 depth = None
         self._preview_draw_t = now
@@ -448,7 +449,7 @@ class MultiCamSession:
                 if s.camera is None or s.mode is None:
                     msg = (
                         f"Camera {s.slot_id + 1} ({s.prefix}) is armed but has no "
-                        "device/configuration. Assign a camera and mode, or uncheck Armed."
+                        "device/configuration.\nAssign a camera and mode, or uncheck Armed."
                     )
                     raise RuntimeError(msg)
                 # Keep slot.record_bag aligned with authoritative intent for UI restore.
@@ -569,6 +570,7 @@ class MultiCamSession:
                             logger.debug("Could not stop the processor of camera slot %s", s.slot_id, exc_info=True)
                         if mp4.exists() and mp4.stat().st_size == 0:
                             mp4.unlink(missing_ok=True)
+                        s.pipeline.record_phase = "failed"
                         msg = (
                             f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
                             f"recording at {s.pipeline.source.width}x"
@@ -598,6 +600,7 @@ class MultiCamSession:
                             s.pipeline.stop_recording()
                         except Exception:
                             logger.debug("Could not stop the recording of camera slot %s", s.slot_id, exc_info=True)
+                        s.pipeline.record_phase = "failed"
                         msg = (
                             f"Camera {s.slot_id + 1} ({s.prefix}) could not start "
                             f"recording at {s.pipeline.source.width}x"
@@ -616,7 +619,7 @@ class MultiCamSession:
                             logger.debug("Could not stop the recording of camera slot %s", s.slot_id, exc_info=True)
                         _raise_slot_error(
                             s,
-                            f".bag was checked but no bag file was created at {bag.name}. "
+                            f".bag was checked but no bag file was created at {bag.name}.\n"
                             "Close RealSense Viewer, use USB 3, then try again.",
                         )
                     s.status = f"recording → {mp4.name}"
@@ -661,6 +664,7 @@ class MultiCamSession:
                 if s.pipeline is None:
                     _raise_slot_error(s, "has no pipeline.")
                 s.pipeline.camera_handler.disable_recording()
+                s.pipeline.record_phase = "stopping"
                 s.status = "stopping…"
             except Exception as exc:  # noqa: BLE001
                 logger.warning("disable_recording failed for %s: %s", s.prefix, exc)

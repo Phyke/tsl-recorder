@@ -12,7 +12,13 @@ logger = logging.getLogger("poc1.app.cards")
 
 from recorder.config import settings  # noqa: E402
 from recorder.devices import StreamMode, pick_auto_camera_for_slot  # noqa: E402
-from recorder.preview_draw import bgr_to_rgb_fill, hud_lines_for_source, overlay_hud  # noqa: E402
+from recorder.preview_draw import (  # noqa: E402
+    barcode_rows_on_tile,
+    bgr_to_rgb_fill,
+    hud_lines_for_source,
+    overlay_hud,
+    preview_settings_for,
+)
 from recorder.session import CameraSlot  # noqa: E402
 from recorder.theme import (  # noqa: E402
     ACCENT,
@@ -58,6 +64,7 @@ class CameraCard(QFrame):
         self.slot_id = slot.slot_id
         self._cam_by_label: dict[str, str] = {}
         self._mode_by_label: dict[str, StreamMode] = {}
+        self._drawn_frame: np.ndarray | None = None
 
         column = QVBoxLayout(self)
         column.setContentsMargins(1, 1, 1, 1)
@@ -120,15 +127,6 @@ class CameraCard(QFrame):
         self.bag_check.clicked.connect(lambda _checked: self._sync_bag())
         self.bag_check.setMinimumWidth(1)
         grid.addWidget(self.bag_check, 3, 1, 1, 3, Qt.AlignmentFlag.AlignLeft)
-        note = label(
-            form,
-            "On Record only. RealSense: Intel SDK .db3/.bag (USB3, close Viewer). "
-            "Elgato: ROS2 color folder *_color (not Intel .bag). "
-            "For true 120fps set mirrorless HDMI to 1080p120.",
-            fg=MUTED,
-            font_spec=("Segoe UI", 8),
-        )
-        grid.addWidget(note, 4, 1, 1, 3, Qt.AlignmentFlag.AlignLeft)
 
         shell_box = QWidget(self)
         shell_row = QHBoxLayout(shell_box)
@@ -328,7 +326,7 @@ class CameraCard(QFrame):
         QMessageBox.warning(
             self.app.root,
             f"Camera {self.slot_id + 1}",
-            "Opened, but no image yet. Check the cable / HDMI signal, then Start preview again.",
+            "Opened, but no image yet.\nCheck the cable / HDMI signal, then Start preview again.",
         )
 
     def stop_preview(self) -> None:
@@ -354,37 +352,43 @@ class CameraCard(QFrame):
         self.badge.setText(text)
         set_label_colors(self.badge, fg, bg, padx=8, pady=2)
 
-    def tick(self) -> None:
+    # full: the tick at each settings.ui_tick_ms. It updates the status and draws the preview again with a new HUD.
+    # Between the full ticks, the preview is drawn only for a new frame.
+    def tick(self, *, full: bool = True) -> None:
         slot = self.session.slots[self.slot_id]
-        status = slot.status
         src = slot.pipeline.source if slot.pipeline else None
-        if src is not None and getattr(src, "device_tag", "") == "elgato":
-            measured = float(getattr(src, "actual_fps", 0) or 0)
-            wanted = int(
-                getattr(src, "requested_fps", 0) or getattr(src, "target_fps", 0) or 0
-            )
-            stamp = int(getattr(src, "target_fps", 0) or 0)
-            if measured > 1:
-                status = f"{status} | delivery ~{measured:.0f}fps"
-                if wanted >= settings.high_rate_fps and measured < wanted * 0.85:
-                    status += (
-                        f" ({capture_not_120_status(wanted, measured, stamp)})"
-                    )
-        try:
-            self.status_label.setText(status)
-            if slot.pipeline and slot.pipeline.camera_handler.is_recording:
-                self._set_badge("Recording", "#7f1d1d", "#fecaca")
-            elif slot.pipeline:
-                self._set_badge("Live", ACCENT, ACCENT_SOFT)
-            else:
-                self._set_badge("Idle", INK, "#e2e8f0")
-        except RuntimeError:
-            return
+        if full:
+            status = slot.status
+            if src is not None and getattr(src, "device_tag", "") == "elgato":
+                measured = float(getattr(src, "actual_fps", 0) or 0)
+                wanted = int(
+                    getattr(src, "requested_fps", 0) or getattr(src, "target_fps", 0) or 0
+                )
+                stamp = int(getattr(src, "target_fps", 0) or 0)
+                if measured > 1:
+                    status = f"{status} | delivery ~{measured:.0f}fps"
+                    if wanted >= settings.high_rate_fps and measured < wanted * 0.85:
+                        status += (
+                            f" ({capture_not_120_status(wanted, measured, stamp)})"
+                        )
+            try:
+                self.status_label.setText(status)
+                if slot.pipeline and slot.pipeline.camera_handler.is_recording:
+                    self._set_badge("Recording", "#7f1d1d", "#fecaca")
+                elif slot.pipeline:
+                    self._set_badge("Live", ACCENT, ACCENT_SOFT)
+                else:
+                    self._set_badge("Idle", INK, "#e2e8f0")
+            except RuntimeError:
+                return
 
         frame_bgr = slot.get_preview_frame()
         if frame_bgr is None:
             return
-        tw = max(self.preview_shell.width() - 4, 280)
+        if not full and frame_bgr is self._drawn_frame:
+            return
+        self._drawn_frame = frame_bgr
+        tw =max(self.preview_shell.width() - 4, 280)
         th = max(self.preview_shell.height() - 4, 160)
         depth = slot.get_depth_preview_frame()
         try:
@@ -403,7 +407,9 @@ class CameraCard(QFrame):
             return
         if src is not None:
             try:
-                rgb = overlay_hud(rgb, hud_lines_for_source(slot, src))
+                prefs = preview_settings_for(slot.camera)
+                top = barcode_rows_on_tile(frame_bgr, prefs.scale_percent, tw, th)
+                rgb = overlay_hud(rgb, hud_lines_for_source(slot, src), prefs, top)
             except Exception:
                 logger.exception("HUD overlay failed for slot %d", self.slot_id)
         show_rgb(self.preview, rgb)

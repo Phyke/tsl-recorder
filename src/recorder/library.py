@@ -88,7 +88,7 @@ class LibraryPage(QFrame):
         tip_layout.addWidget(
             label(
                 tip,
-                "Library: select MP4 → Play. Select RealSense .db3/.bag → Export to MP4 → Play. "
+                "Library: select MP4 → Play.\nSelect RealSense .db3/.bag → Export to MP4 → Play.\n"
                 "Record saves MP4 + .db3 in the folder; JSON/CSV are in meta/.",
                 fg=MUTED,
                 font_spec=("Segoe UI", 9),
@@ -179,9 +179,9 @@ class LibraryPage(QFrame):
         export_grid.addWidget(
             label(
                 export,
-                "Export selected bag → NEW {name}_h264.mp4 (decoded). "
-                "RealSense = .db3/.bag via SDK. Elgato = *_color folder. "
-                "Record MP4 is kept. Install ffmpeg for fallbacks.",
+                "Export selected bag → NEW {name}_h264.mp4 (decoded).\n"
+                "RealSense = .db3/.bag via SDK.\nElgato = *_color folder.\n"
+                "Record MP4 is kept.\nInstall ffmpeg for fallbacks.",
                 fg=MUTED,
                 font_spec=("Segoe UI", 8),
                 wrap=True,
@@ -296,7 +296,7 @@ class LibraryPage(QFrame):
                     f"{path.name} is an Elgato ROS2 color bag folder "
                     "(m_*_color with .db3 + metadata.yaml — not a video).\n\n"
                     f"Play the Record MP4 instead?\n{sibling.name}\n\n"
-                    "Yes = play MP4.  No = stay here.\n"
+                    "Yes = play MP4.\nNo = stay here.\n"
                     "To decode the bag: select this folder → Export selected.",
                 ):
                     self._start_playback(sibling)
@@ -319,7 +319,7 @@ class LibraryPage(QFrame):
                     f"{path.name} is a bag/SDK file and cannot play directly.\n\n"
                     f"A matching Record MP4 exists:\n{sibling.name}\n\n"
                     "Play that original MP4 now?\n\n"
-                    "(Cancel = stay here. Export selected decodes the .db3 to a NEW mp4 "
+                    "(Cancel = stay here.)\n(Export selected decodes the .db3 to a NEW mp4 "
                     "and does not replace the Record file.)",
                 ):
                     self._start_playback(sibling)

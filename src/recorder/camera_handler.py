@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from recorder.config import settings
+from recorder.config import recording_settings_for, settings
 from recorder.frame_source import FrameSource
 
 logger = logging.getLogger("poc1.camera_handler")
@@ -163,15 +163,18 @@ class DropCountingQueue[T]:
 class CameraHandler:
     source: FrameSource
     viewer_queue_size: int = 2          # small: only latest few matter
-    processor_queue_size: int = 512     # generous buffer against jitter at 120fps
+    processor_queue_size: int = 0       # 0: the MP4 queue size of the Recording settings
 
     def __post_init__(self) -> None:
+        rec = recording_settings_for(str(getattr(self.source, "device_tag", "") or ""))
+        if not self.processor_queue_size:
+            self.processor_queue_size = rec.mp4_queue_frames
         # FHD@120 needs a deeper buffer; fake proofs prefer no-drop backpressure.
         fps = int(getattr(self.source, "target_fps", 30) or 30)
         mode = str(getattr(self.source, "mode", "") or "")
-        if mode == "fake" or fps >= settings.deep_buffer_fps:
-            # ~30s at 120fps plus margin so Stop can drain without mid-take drops.
-            self.processor_queue_size = max(self.processor_queue_size, 4800)
+        if mode == "fake" or fps >= rec.deep_buffer_fps:
+            # The default 4800 is ~40s at 120fps, so Stop can drain without mid-take drops.
+            self.processor_queue_size = max(self.processor_queue_size, rec.mp4_queue_frames_deep)
         self.viewer_queue: DropCountingQueue[FrameEnvelope] = DropCountingQueue(
             self.viewer_queue_size, drop_oldest=True, name="viewer"
         )
