@@ -195,10 +195,11 @@ class Pipeline:
         # Defer Elgato ROS2 bag until Record frames are flowing. Starting the
         # bag writer before arm raced DirectShow and left frames_read==0 while
         # the HUD still showed a stale ~59 from preview.
+        # The .db3 queue is attached now, and only its writer thread starts later (see _attach_uvc_bag).
         pending_uvc_bag: Path | None = None
         if bag_path is not None:
             if tag == "elgato":
-                pending_uvc_bag = Path(bag_path)
+                pending_uvc_bag = self._attach_uvc_bag(Path(bag_path), rec)
                 self.active_bag_path = None
             elif prearmed_bag is not None:
                 self.active_bag_path = prearmed_bag
@@ -260,6 +261,18 @@ class Pipeline:
         self._record_held = False
         self.release_recording()
         self.finish_record_arm()
+
+    # The Elgato .db3: its queue is attached to the processor before the first Record frame, so the .db3 gets each frame
+    # from frame 0. Only the writer thread starts later (finish_record_arm); the queue holds the frames until then.
+    def _attach_uvc_bag(self, path: Path, rec: RecordingSettings) -> Path:
+        self._uvc_bag = UvcRos2Bag(
+            path,
+            queue_frames=rec.db3_queue_frames,
+            jpeg_quality=rec.db3_jpeg_quality,
+            drain_s=float(rec.db3_drain_s),
+        )
+        self.processor.sidecar_bag = self._uvc_bag
+        return path
 
     # The start of a Record: the status line shows Starting, and the processor takes the MP4 codec and the drain
     # limit of the Recording settings of this camera type.
@@ -372,16 +385,9 @@ class Pipeline:
                 )
                 raise RuntimeError(msg)
 
-        if pending_uvc_bag is not None:
-            self._uvc_bag = UvcRos2Bag(
-                pending_uvc_bag,
-                queue_frames=rec.db3_queue_frames,
-                jpeg_quality=rec.db3_jpeg_quality,
-                drain_s=float(rec.db3_drain_s),
-            )
+        if pending_uvc_bag is not None and self._uvc_bag is not None:
             self._uvc_bag.start()
             self.active_bag_path = pending_uvc_bag
-            self.processor.sidecar_bag = self._uvc_bag
             self._pending_uvc_bag = None
 
         logger.info(

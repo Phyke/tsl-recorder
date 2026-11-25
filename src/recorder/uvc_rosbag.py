@@ -64,21 +64,23 @@ class UvcRos2Bag:
             self.dropped += 1
 
     def stop(self) -> Path | None:
-        # Let the worker finish queued JPEGs before sentinel (no software loss
-        # at Stop when encode can keep up).
-        deadline = time.monotonic() + self.drain_s
-        while not self._q.empty() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        try:
-            self._q.put(None, timeout=5.0)
-        except queue.Full:
-            logger.warning("ROS2 bag queue full at stop — forcing sentinel")
-            with contextlib.suppress(queue.Empty):
-                self._q.get_nowait()
-            self._q.put_nowait(None)
-        if self._thread:
+        # The queue takes frames before the writer thread starts. A writer thread that never started (a failed Record
+        # start) or that stopped has nothing to drain, so Stop does not wait for it.
+        if self._thread is not None and self._thread.is_alive():
+            # Let the worker finish queued JPEGs before sentinel (no software loss
+            # at Stop when encode can keep up).
+            deadline = time.monotonic() + self.drain_s
+            while not self._q.empty() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            try:
+                self._q.put(None, timeout=5.0)
+            except queue.Full:
+                logger.warning("ROS2 bag queue full at stop — forcing sentinel")
+                with contextlib.suppress(queue.Empty):
+                    self._q.get_nowait()
+                self._q.put_nowait(None)
             self._thread.join(timeout=45.0)
-            self._thread = None
+        self._thread = None
         db3 = None
         if self.path.is_dir():
             files = list(self.path.glob("*.db3"))
