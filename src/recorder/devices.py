@@ -1788,6 +1788,13 @@ class ConfiguredRealSenseSource:
         self._profile: Any | None = None
         self.rs_recorder: Any | None = None
         self._pending_frame: np.ndarray | None = None
+        # The SDK frame number of _pending_frame, and of the frame that read() returned last. The capture thread reads
+        # frame_number after each read() for the frames CSV of each take.
+        self._pending_frame_number: int | None = None
+        self.frame_number: int | None = None
+        # True when read() returned the pending frame. That frame is from before Record (flush_to_live or start), so
+        # the RealSense .db3 does not have it, and the capture thread keeps it out of the MP4.
+        self.frame_from_flush = False
         self._colorizer: Any | None = None
         self.wanted = (self.width, self.height, self.target_fps, self.pixel_format)
         # When True, pause SDK bag writer immediately after start (preview pre-arm).
@@ -2162,6 +2169,7 @@ class ConfiguredRealSenseSource:
             if first is None:
                 _raise_no_usable_frame()
             self._pending_frame = first
+            self._pending_frame_number = self._frame_number_of(frames)
             if float(np.mean(first)) < settings.black_frame_mean:
                 logger.warning(
                     "RealSense first frames are nearly black — lens cap / AE settling?"
@@ -2330,6 +2338,16 @@ class ConfiguredRealSenseSource:
             return None
         return self._convert_color(color)
 
+    # The SDK frame number of the frame that _frames_to_bgr uses: depth for z16, infrared (else color) for y8, else color.
+    def _frame_number_of(self, frames: Any) -> int | None:  # noqa: ANN401
+        if self.pixel_format == "z16":
+            frame = frames.get_depth_frame()
+        elif self.pixel_format == "y8":
+            frame = frames.get_infrared_frame() or frames.get_color_frame()
+        else:
+            frame = frames.get_color_frame()
+        return int(frame.get_frame_number()) if frame else None
+
     def _convert_color(self, color: Any) -> np.ndarray:  # noqa: ANN401
         frame = np.asanyarray(color.get_data())
         if self.pixel_format == "rgb8":
@@ -2359,6 +2377,7 @@ class ConfiguredRealSenseSource:
         if self._pipeline is None:
             return
         latest: np.ndarray | None = None
+        latest_number: int | None = None
         deadline = time.perf_counter() + 0.25
         while time.perf_counter() < deadline:
             try:
@@ -2371,19 +2390,26 @@ class ConfiguredRealSenseSource:
             bgr = self._frames_to_bgr(frames)
             if bgr is not None:
                 latest = bgr
+                latest_number = self._frame_number_of(frames)
         if latest is None:
             try:
                 frames = self._pipeline.wait_for_frames(timeout_ms=200)
                 latest = self._frames_to_bgr(frames)
+                latest_number = self._frame_number_of(frames)
             except Exception:  # noqa: BLE001
                 latest = None
         self._pending_frame = latest
+        self._pending_frame_number = latest_number
 
     def read(self) -> np.ndarray | None:
         if self._pending_frame is not None:
             frame = self._pending_frame
             self._pending_frame = None
+            self.frame_number = self._pending_frame_number
+            self.frame_from_flush = True
             return frame
+        self.frame_number = None
+        self.frame_from_flush = False
         if self._pipeline is None:
             return None
         try:
@@ -2391,7 +2417,9 @@ class ConfiguredRealSenseSource:
         except Exception:  # noqa: BLE001
             return None
         self._stash_depth(frames)
-        return self._frames_to_bgr(frames)
+        frame = self._frames_to_bgr(frames)
+        self.frame_number = self._frame_number_of(frames) if frame is not None else None
+        return frame
 
 
 

@@ -41,6 +41,8 @@ class FrameEnvelope:
     seq: int
     capture_ts: float
     frame: np.ndarray
+    # The frame number of the camera (the RealSense SDK frame number), or None when the source has none.
+    frame_number: int | None = None
 
 
 class DropCountingQueue[T]:
@@ -362,13 +364,17 @@ class CameraHandler:
             # Holding _record_lock across put_live (up to 2s) stalled Elgato reads
             # → FPS collapse (~11) and "0 frames on Record" even with live preview.
             with self._record_lock:
-                recording_now = self._recording.is_set()
+                # A frame that the source kept at its flush is from before Record (the RealSense .db3 does not have it),
+                # and it can be older than a frame already recorded. The preview shows it, but the MP4 does not take it.
+                recording_now = self._recording.is_set() and not getattr(self.source, "frame_from_flush", False)
                 if recording_now:
                     seq = self._seq
                     self._seq += 1
                     self.frames_read += 1
                     self.frames_to_recorder += 1
-                    env = FrameEnvelope(seq=seq, capture_ts=time.time(), frame=owned)
+                    # Only this thread calls read(), so frame_number belongs to this frame.
+                    number = getattr(self.source, "frame_number", None)
+                    env = FrameEnvelope(seq=seq, capture_ts=time.time(), frame=owned, frame_number=number)
                 else:
                     env = FrameEnvelope(seq=-1, capture_ts=time.time(), frame=owned)
 

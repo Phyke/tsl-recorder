@@ -65,6 +65,8 @@ class Processor:
         self.dropped_at_stop = 0
         # The end of the drain at Stop (time.perf_counter), while the drain runs. The Record tab shows the time left.
         self.drain_deadline: float | None = None
+        # (barcode seq, camera frame number) of each frame in the MP4, in the MP4 order, for the frames CSV of the take.
+        self.frame_log: list[tuple[int, int | None]] = []
 
     def configure_output(
         self,
@@ -99,6 +101,7 @@ class Processor:
         self._slow_encode_ms_max = 0.0
         self.out_queue.reset_dropped()
         self.dropped_at_stop = 0
+        self.frame_log = []
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
         fourcc = cv2.VideoWriter_fourcc(*self.chosen_fourcc)
@@ -193,6 +196,7 @@ class Processor:
 
             t0 = time.perf_counter()
             self._writer.write(frame)
+            self.frame_log.append((env.seq, env.frame_number))
             encode_ms = (time.perf_counter() - t0) * 1000.0
             sidecar = getattr(self, "sidecar_bag", None)
             if sidecar is not None:

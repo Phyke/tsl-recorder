@@ -9,6 +9,7 @@ armed). Frame drops on the record path are counted; preview may drop-oldest.
 """
 
 import contextlib
+import csv
 import json
 import logging
 from collections.abc import Callable
@@ -544,6 +545,7 @@ class Pipeline:
                 report["report_path"] = str(report_path)
             except Exception:
                 logger.exception("could not write report json")
+            self._write_frames_csv()
         logger.info("Recording stopped: %s", report)
         is_uvc_bag = str(getattr(self.source, "device_tag", "") or "") == "elgato"
         if expected_bag is not None and not self._bag_written and not is_uvc_bag:
@@ -611,6 +613,25 @@ class Pipeline:
             "failed": "See the status bar for the cause",
         }
         return self.record_phase, statuses.get(self.record_phase, ""), queues
+
+    # One row for each MP4 frame, in the MP4 order: the frame index in the MP4, the barcode seq, and the camera frame
+    # number (the RealSense SDK frame number, the same number as in the .db3). The file is next to the report
+    # (<name>_frames.csv). Only a source with frame numbers (the RealSense) writes it.
+    def _write_frames_csv(self) -> None:
+        log = self.processor.frame_log
+        if self.output_path is None or not any(number is not None for _seq, number in log):
+            return
+        name = f"{self.output_path.stem}_frames.csv"
+        path = Path(self.monitor_csv).with_name(name) if self.monitor_csv is not None else self.output_path.with_name(name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["mp4_frame", "barcode_seq", "camera_frame_number"])
+                writer.writerows((index, seq, "" if number is None else number) for index, (seq, number) in enumerate(log))
+            logger.info("Frames CSV: %d rows -> %s", len(log), path)
+        except OSError:
+            logger.exception("could not write the frames CSV")
 
     # The time left of the MP4 drain limit at Stop, for the Draining MP4 text. Empty before the drain starts.
     def _drain_countdown(self) -> str:

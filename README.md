@@ -48,6 +48,7 @@ The Settings tab saves its values in `settings.json` in the project folder. Each
   - MP4 queue, "dropped at Stop": the frames still in the queue when the MP4 drain limit at Stop ends. Stop deletes them. This count is separate from the queue drops ("dropped"). The report has it as `dropped_at_stop`, and the queue drops as `dropped_processor_queue`. Both counts are part of the dropped count of "Saved".
   - Draining MP4: the detail text shows the frames left in the MP4 queue and the seconds left of the MP4 drain limit at Stop.
   - The app cannot read the queue of the RealSense SDK .db3 writer.
+- RealSense: each take also writes `meta/<name>_frames.csv`, with one row for each MP4 frame in the MP4 order: `mp4_frame` (the frame index in the MP4), `barcode_seq` (the barcode in the frame), and `camera_frame_number` (the RealSense SDK frame number of the image). The .db3 has the same SDK frame numbers, so the file matches each MP4 frame to its .db3 frame.
 - Each page has a "Reset this page to defaults" button, and "Reset all settings to defaults" is under the list of pages. Each button asks first. A reset does not change the Save folder.
 - The Save folder on the Setup tab is also saved when it changes.
 - If `settings.json` has a bad value, the app starts with the default settings and shows the bad key. The next change on the Settings tab replaces the file.
