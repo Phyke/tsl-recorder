@@ -1839,6 +1839,7 @@ class UnifiedApp:
                     "device_tag",
                     "frames_read_by_camera",
                     "frames_written",
+                    "dropped_at_stop",
                     "width",
                     "height",
                     "requested_fps",

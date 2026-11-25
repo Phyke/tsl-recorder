@@ -10,6 +10,7 @@ encoded units and may remux FPS metadata after stop.
 """
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -60,6 +61,10 @@ class Processor:
         self._slow_encodes = 0
         self._slow_encode_ms_max = 0.0
         self.sidecar_bag = None
+        # The frames still in the queue when the drain limit at Stop ends. Stop deletes them, so they are not in the MP4.
+        self.dropped_at_stop = 0
+        # The end of the drain at Stop (time.perf_counter), while the drain runs. The Record tab shows the time left.
+        self.drain_deadline: float | None = None
 
     def configure_output(
         self,
@@ -93,6 +98,7 @@ class Processor:
         self._slow_encodes = 0
         self._slow_encode_ms_max = 0.0
         self.out_queue.reset_dropped()
+        self.dropped_at_stop = 0
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
         fourcc = cv2.VideoWriter_fourcc(*self.chosen_fourcc)
@@ -134,6 +140,7 @@ class Processor:
             self._thread = None
         drained = 0
         deadline = time.perf_counter() + self.drain_s
+        self.drain_deadline = deadline
         while time.perf_counter() < deadline:
             env = self.in_queue.get(timeout=0.05)
             if env is None:
@@ -142,7 +149,9 @@ class Processor:
                 continue
             self._encode(env)
             drained += 1
+        self.drain_deadline = None
         leftover = self.in_queue.discard_all()
+        self.dropped_at_stop = leftover
         if drained:
             logger.info("processor stop: encoded %d queued frame(s)", drained)
         if leftover:
@@ -162,6 +171,13 @@ class Processor:
                 "processor: %d/%d encodes exceeded realtime budget (max %.1fms)",
                 self._slow_encodes, self.frames_processed, self._slow_encode_ms_max,
             )
+
+    # The whole seconds left of the drain limit at Stop, or None when no drain runs.
+    def drain_seconds_left(self) -> int | None:
+        deadline = self.drain_deadline
+        if deadline is None:
+            return None
+        return math.ceil(max(0.0, deadline - time.perf_counter()))
 
     def _encode(self, env: FrameEnvelope) -> None:
         with self._encode_lock:

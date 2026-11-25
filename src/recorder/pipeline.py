@@ -590,20 +590,28 @@ class Pipeline:
             return "recording", text, queues
         if self.record_phase == "saved":
             report = self.last_report
-            dropped = sum(int(report.get(key, 0) or 0) for key in ("dropped_processor_queue", "dropped_recorder_queue", "bag_dropped"))
+            drop_keys = ("dropped_processor_queue", "dropped_at_stop", "dropped_recorder_queue", "bag_dropped")
+            dropped = sum(int(report.get(key, 0) or 0) for key in drop_keys)
             dropped += self._rtbuf_take[0] if self._rtbuf_take is not None else 0
             text =f"{report.get('frames_written', 0)} frames written  ·  {dropped} dropped  ·  ready for the next take"
             return ("saved_dropped" if dropped else "saved"), text, queues
         statuses = {
             "starting": "Opening the writers…",
             "stopping": "No new frames; the .db3 closes…",
-            "draining_mp4": f"{mp4_queue.qsize()} frames left in the MP4 queue",
+            "draining_mp4": f"{mp4_queue.qsize()} frames left in the MP4 queue" + self._drain_countdown(),
             "finishing_db3": f"{bag.queued() if bag is not None else 0} frames left in the .db3 queue",
             "saving": "Closing the files…",
             "fixing_fps": "Fixing the MP4 playback speed…",
             "failed": "See the status bar for the cause",
         }
         return self.record_phase, statuses.get(self.record_phase, ""), queues
+
+    # The time left of the MP4 drain limit at Stop, for the Draining MP4 text. Empty before the drain starts.
+    def _drain_countdown(self) -> str:
+        left = self.processor.drain_seconds_left()
+        if left is None:
+            return ""
+        return f"  ·  {left} s left of the {self.processor.drain_s:g} s drain limit"
 
     # The buffers and queues of this camera that the app can read, in the order of the frames: (name, fill from 0 to 1
     # or None for no bar, count text). The real-time buffer has no fill value: ffmpeg reports only its drops. Its
@@ -626,6 +634,10 @@ class Pipeline:
             add("ffmpeg queue", ffmpeg_fill[0], ffmpeg_fill[1], None)
         mp4_queue = self.camera_handler.processor_queue
         add("MP4 queue", mp4_queue.qsize(), mp4_queue.maxsize, mp4_queue.dropped_count)
+        # The frames that Stop deleted at the end of the drain limit: a separate count, after the queue drops.
+        if self.processor.dropped_at_stop:
+            name, fill, text = queues[-1]
+            queues[-1] = (name, fill, f"{text}  ·  dropped at Stop {self.processor.dropped_at_stop}")
         bag = self._uvc_bag
         if bag is not None:
             add(".db3 queue", bag.queued(), bag.queue_limit, bag.dropped)
@@ -662,6 +674,7 @@ class Pipeline:
         gaps = recorder_summary["sequence_gaps"]
         dropped_proc = self.camera_handler.processor_queue.dropped_count
         dropped_rec = recorder_summary["dropped_before_recorder"]
+        dropped_stop = self.processor.dropped_at_stop
         proc_summary = self.processor.summary()
         no_drops = (
             read > 0
@@ -669,6 +682,7 @@ class Pipeline:
             and not gaps
             and dropped_proc == 0
             and dropped_rec == 0
+            and dropped_stop == 0
         )
         no_capture = read == 0
         requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
@@ -692,6 +706,8 @@ class Pipeline:
             "dropped_viewer_queue": self.camera_handler.viewer_queue.dropped_count,
             "dropped_processor_queue": dropped_proc,
             "dropped_recorder_queue": dropped_rec,
+            # The frames still in the MP4 queue when the drain limit at Stop ended (not part of dropped_processor_queue).
+            "dropped_at_stop": dropped_stop,
             "codec": proc_summary.get("codec") or recorder_summary.get("codec", ""),
             "fourcc": proc_summary.get("fourcc") or recorder_summary.get("fourcc", ""),
             "output_path": recorder_summary.get("output_path", ""),

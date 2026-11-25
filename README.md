@@ -45,6 +45,8 @@ The Settings tab saves its values in `settings.json` in the project folder. Each
   - A fill bar is green below half full, amber below 90 %, and red from 90 %.
   - Real-time buffer: the ffmpeg `-rtbufsize` buffer. It has no fill bar, because ffmpeg writes a line only when the buffer drops a frame. The line shows the count of these drops and the fill at the last drop. The count starts at Record and stops at Stop. Before the first take, it counts from the preview start. These drops are part of the dropped count of "Saved".
   - The ffmpeg queue has no drop count.
+  - MP4 queue, "dropped at Stop": the frames still in the queue when the MP4 drain limit at Stop ends. Stop deletes them. This count is separate from the queue drops ("dropped"). The report has it as `dropped_at_stop`, and the queue drops as `dropped_processor_queue`. Both counts are part of the dropped count of "Saved".
+  - Draining MP4: the detail text shows the frames left in the MP4 queue and the seconds left of the MP4 drain limit at Stop.
   - The app cannot read the queue of the RealSense SDK .db3 writer.
 - Each page has a "Reset this page to defaults" button, and "Reset all settings to defaults" is under the list of pages. Each button asks first. A reset does not change the Save folder.
 - The Save folder on the Setup tab is also saved when it changes.
