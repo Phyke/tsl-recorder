@@ -39,6 +39,7 @@ The Settings tab saves its values in `settings.json` in the project folder. Each
   - Apply is off while a preview starts or a recording runs.
   - The changes that wait are not saved. If you close the app before Apply, they are lost.
 - The text between the Stop button and the Last report button shows the automatic Record check, with each issue on its own line. Red, with Record off: two or more 1920x1080 cameras at 90 fps or more are armed. Amber, with Record on: an Elgato asked for 90 fps or more but delivers less than 85 % of it (the HDMI signal is not 1080p120).
+- The Record tab shows the length of the take next to the Stop button (mm:ss). It counts in red while Record runs. At Stop, it stops and stays in gray until the next Record.
 - The Record tab shows a status row for each camera: a colored badge and a detail text. Under it, one line for each queue of the camera: the name, a fill bar, and the count.
   - Gray: Preview off, Not armed. Green: Ready, Saved. Red: Recording. Amber: Starting, Stopping, Draining MP4, Finishing .db3, Saving, Fixing fps. Orange: Saved with drops. Dark red: Failed.
   - The lines, in the order of the frames: Real-time buffer and ffmpeg queue (Elgato through ffmpeg only), MP4 queue, .db3 queue (Elgato, only while a .db3 is open), Recorder queue.

@@ -13,6 +13,7 @@ import logging
 import math
 import sys
 import threading
+import time
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -194,6 +195,8 @@ class UnifiedApp:
         self._tick_count = 0
         # Settings > Recording: the changes that wait for Apply, (settings key, field) -> the new value.
         self._recording_pending: dict[tuple[str, str], object] = {}
+        # The start of the running take (time.monotonic), for the take length on the Record tab. None when no take runs.
+        self._record_t0: float | None = None
 
         root.setWindowTitle(f"POC1 Recorder — {BUILD_ID}")
         root.resize(1240, 860)
@@ -780,6 +783,10 @@ class UnifiedApp:
             state="disabled",
         )
         actions_row.addWidget(self.stop_record_btn)
+        # The take length: it counts while Record runs, and it keeps the last value after Stop.
+        actions_row.addSpacing(16)
+        self.record_time_label = label(actions, "", fg=RED, font_spec=("Segoe UI Semibold", 14))
+        actions_row.addWidget(self.record_time_label)
         # The Record check text (refresh_record_gate), in the space between Stop and Last report. Each issue has its own
         # line, and a long line wraps.
         actions_row.addSpacing(16)
@@ -800,6 +807,18 @@ class UnifiedApp:
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
+
+    # The take length on the Record tab, as mm:ss (h:mm:ss from 1 hour). fg changes the text color.
+    def _show_record_time(self, fg: str | None = None) -> None:
+        if self._record_t0 is None:
+            return
+        hours, rest = divmod(int(time.monotonic() - self._record_t0), 3600)
+        minutes, seconds = divmod(rest, 60)
+        text = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+        if self.record_time_label.text() != text:
+            self.record_time_label.setText(text)
+        if fg is not None:
+            set_label_colors(self.record_time_label, fg)
 
     def _set_record_tip(self, text: str, fg: str = MUTED) -> None:
         self.record_tip_label.setText(text)
@@ -1533,6 +1552,8 @@ class UnifiedApp:
             QMessageBox.critical(self.root, "Recording", error)
             return
         self._set_busy(busy=False, recording=True)
+        self._record_t0 = time.monotonic()
+        self._show_record_time(fg=RED)
         n = max(1, len(paths))
         extra = self._elgato_live_lines()
         tip = f"Recording {n} camera(s)…"
@@ -1572,6 +1593,9 @@ class UnifiedApp:
             return
 
         self._stopping = True
+        # The take ends at Stop: the length stops counting and stays in gray until the next Record.
+        self._show_record_time(fg=MUTED)
+        self._record_t0 = None
         self._set_busy(busy=True, recording=True)
         self._set_record_tip("Stopping… saving files (please wait a moment).")
         self.set_status("Stopping recording…")
@@ -1902,6 +1926,7 @@ class UnifiedApp:
             logger.exception("record preview tick failed")
         if not full:
             return
+        self._show_record_time()
         try:
             self._tick_record_status()
         except Exception:
