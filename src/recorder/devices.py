@@ -1719,10 +1719,11 @@ class FormattedUvcSource(CvCaptureSource):
             )
         self._log_d1_uvc_start()
 
-    # The ffmpeg frame queue (frames in the queue, queue size), or None when OpenCV reads the camera.
-    def ffmpeg_queue(self) -> tuple[int, int] | None:
+    # The ffmpeg frame queue (frames in the queue, queue size, frames dropped from the full queue since the lock), or None
+    # when OpenCV reads the camera.
+    def ffmpeg_queue(self) -> tuple[int, int, int] | None:
         ff = self._ffmpeg
-        return None if ff is None else (ff.queued(), ff.queue_limit)
+        return None if ff is None else (ff.queued(), ff.queue_limit, ff.queue_drops)
 
     # The ffmpeg real-time buffer (frames dropped since the lock, fill % at the last drop), or None when OpenCV reads the camera.
     def ffmpeg_rtbuf(self) -> tuple[int, int] | None:

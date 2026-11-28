@@ -120,6 +120,9 @@ class Pipeline:
         # The ffmpeg real-time buffer drops at the record start, and the drops and the last fill % of the last take (fixed at Stop).
         self._rtbuf_base = 0
         self._rtbuf_take: tuple[int, int] | None = None
+        # The frames dropped from the full ffmpeg queue: the count at the record start, and the count of the last take (fixed at Stop).
+        self._ffq_base = 0
+        self._ffq_take: int | None = None
         self._record_held = False
         self._pending_uvc_bag: Path | None = None
         self._record_allow_remux = True
@@ -282,6 +285,9 @@ class Pipeline:
         rtbuf = self._ffmpeg_rtbuf()
         self._rtbuf_base = rtbuf[0] if rtbuf is not None else 0
         self._rtbuf_take = None
+        ffq = self._ffmpeg_queue()
+        self._ffq_base = ffq[2] if ffq is not None else 0
+        self._ffq_take = None
         rec = recording_settings_for(str(getattr(self.source, "device_tag", "") or ""))
         self.processor.codec = rec.mp4_codec
         self.processor.drain_s = float(rec.mp4_drain_s)
@@ -465,6 +471,8 @@ class Pipeline:
             logger.exception("disable_recording failed")
         rtbuf = self._ffmpeg_rtbuf()
         self._rtbuf_take = (max(rtbuf[0] - self._rtbuf_base, 0), rtbuf[1]) if rtbuf is not None else None
+        ffq = self._ffmpeg_queue()
+        self._ffq_take = max(ffq[2] - self._ffq_base, 0) if ffq is not None else None
         # Pause the .db3 on the same beat the MP4 stops accepting frames.
         # Doing this after pause_reads lets the SDK keep writing while Python
         # has already stopped, or the other way around if the queue still drains.
@@ -598,9 +606,11 @@ class Pipeline:
             return "recording", text, queues
         if self.record_phase == "saved":
             report = self.last_report
-            drop_keys = ("dropped_processor_queue", "dropped_at_stop", "dropped_recorder_queue", "bag_dropped")
+            drop_keys = (
+                "dropped_capture_frames", "dropped_ffmpeg_queue", "dropped_processor_queue", "dropped_at_stop", "dropped_recorder_queue",
+                "bag_dropped",
+            )
             dropped = sum(int(report.get(key, 0) or 0) for key in drop_keys)
-            dropped += self._rtbuf_take[0] if self._rtbuf_take is not None else 0
             text =f"{report.get('frames_written', 0)} frames written  ·  {dropped} dropped  ·  ready for the next take"
             return ("saved_dropped" if dropped else "saved"), text, queues
         statuses = {
@@ -641,8 +651,8 @@ class Pipeline:
         return f"  ·  {left} s left of the {self.processor.drain_s:g} s drain limit"
 
     # The buffers and queues of this camera that the app can read, in the order of the frames: (name, fill from 0 to 1
-    # or None for no bar, count text). The real-time buffer has no fill value: ffmpeg reports only its drops. Its
-    # drops count from the record start, and are fixed at Stop. The ffmpeg queue has no drop count. The .db3 queue
+    # or None for no bar, count text). The real-time buffer has no fill value: ffmpeg reports only its drops. The drops of
+    # the real-time buffer and of the ffmpeg queue count from the record start, and are fixed at Stop. The .db3 queue
     # shows only while a .db3 is open.
     def record_queues(self) -> list[tuple[str, float | None, str]]:
         queues: list[tuple[str, float | None, str]] = []
@@ -655,10 +665,9 @@ class Pipeline:
         if rtbuf is not None:
             drops, percent = self._rtbuf_take or (max(rtbuf[0] - self._rtbuf_base, 0), rtbuf[1])
             queues.append(("Real-time buffer", None, f"dropped {drops}" + (f"  ·  last drop at {percent} % full" if drops else "")))
-        ffmpeg_queue = getattr(self.source, "ffmpeg_queue", None)
-        ffmpeg_fill = ffmpeg_queue() if callable(ffmpeg_queue) else None
-        if ffmpeg_fill is not None:
-            add("ffmpeg queue", ffmpeg_fill[0], ffmpeg_fill[1], None)
+        ffq = self._ffmpeg_queue()
+        if ffq is not None:
+            add("ffmpeg queue", ffq[0], ffq[1], self._ffq_take if self._ffq_take is not None else max(ffq[2] - self._ffq_base, 0))
         mp4_queue = self.camera_handler.processor_queue
         add("MP4 queue", mp4_queue.qsize(), mp4_queue.maxsize, mp4_queue.dropped_count)
         # The frames that Stop deleted at the end of the drain limit: a separate count, after the queue drops.
@@ -676,6 +685,11 @@ class Pipeline:
     def _ffmpeg_rtbuf(self) -> tuple[int, int] | None:
         rtbuf = getattr(self.source, "ffmpeg_rtbuf", None)
         return rtbuf() if callable(rtbuf) else None
+
+    # The ffmpeg frame queue of the source (frames in it, size, drops since the lock), or None without ffmpeg.
+    def _ffmpeg_queue(self) -> tuple[int, int, int] | None:
+        ffq = getattr(self.source, "ffmpeg_queue", None)
+        return ffq() if callable(ffq) else None
 
     def stop(self) -> dict:
         """Full shutdown (recording + preview + camera)."""
@@ -702,6 +716,9 @@ class Pipeline:
         dropped_proc = self.camera_handler.processor_queue.dropped_count
         dropped_rec = recorder_summary["dropped_before_recorder"]
         dropped_stop = self.processor.dropped_at_stop
+        # The ffmpeg drops of the take, fixed at Stop (None without ffmpeg): the real-time buffer, and the full ffmpeg queue.
+        dropped_capture = self._rtbuf_take[0] if self._rtbuf_take is not None else None
+        dropped_ffq = self._ffq_take
         proc_summary = self.processor.summary()
         no_drops = (
             read > 0
@@ -710,6 +727,8 @@ class Pipeline:
             and dropped_proc == 0
             and dropped_rec == 0
             and dropped_stop == 0
+            and not dropped_capture
+            and not dropped_ffq
         )
         no_capture = read == 0
         requested = int(getattr(self, "_requested_fps", self.source.target_fps) or 30)
@@ -735,6 +754,10 @@ class Pipeline:
             "dropped_recorder_queue": dropped_rec,
             # The frames still in the MP4 queue when the drain limit at Stop ended (not part of dropped_processor_queue).
             "dropped_at_stop": dropped_stop,
+            # The ffmpeg real-time buffer (-rtbufsize) drops between Record and Stop, under the name that the validator reads.
+            "dropped_capture_frames": dropped_capture,
+            # The frames that the pipe reader removed from the full ffmpeg queue between Record and Stop.
+            "dropped_ffmpeg_queue": dropped_ffq,
             "codec": proc_summary.get("codec") or recorder_summary.get("codec", ""),
             "fourcc": proc_summary.get("fourcc") or recorder_summary.get("fourcc", ""),
             "output_path": recorder_summary.get("output_path", ""),

@@ -146,6 +146,8 @@ class FfmpegDshowCaptureSource:
         # The frames that the real-time buffer dropped since the lock, and the buffer fill (%) at the last drop.
         self.rtbuf_drops = 0
         self.rtbuf_last_percent = 0
+        # The frames that the pipe reader removed from the full ffmpeg queue since the lock.
+        self.queue_drops = 0
         self._pending: np.ndarray | None = None
         self._active_device = ""
         self._active_input_mode = ""
@@ -199,6 +201,7 @@ class FfmpegDshowCaptureSource:
                             rate,
                         )
                         self.rtbuf_drops = 0
+                        self.queue_drops = 0
                         self._seek_live_edge()
                         return
                     self.stop()
@@ -373,6 +376,7 @@ class FfmpegDshowCaptureSource:
                 except queue.Full:
                     with contextlib.suppress(queue.Empty):
                         self._queue.get_nowait()
+                        self.queue_drops += 1
                     with contextlib.suppress(queue.Full):
                         self._queue.put_nowait(owned)
         finally:
@@ -393,43 +397,22 @@ class FfmpegDshowCaptureSource:
             latest = frame
         self._pending = latest
 
-    def _dequeue_newest(self, *, block: bool, timeout: float = 2.0) -> np.ndarray | None:
-        """Return the freshest queued frame (drop older buffered copies)."""
-        if block:
-            try:
-                frame = self._queue.get(timeout=timeout)
-            except queue.Empty:
-                return None
-        else:
-            try:
-                frame = self._queue.get_nowait()
-            except queue.Empty:
-                return None
-        if frame is None:
-            return None
-        while True:
-            try:
-                nxt = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if nxt is None:
-                return None
-            frame = nxt
-        return frame
-
     # The frames in the queue between the ffmpeg reader and the capture thread, for the Record tab.
     def queued(self) -> int:
         return self._queue.qsize()
 
+    # The oldest frame first: the capture thread takes every frame in order, so a short stall loses no frame. The preview
+    # skips old frames in its own viewer queue. None when the reader stopped, or after 2 s with no frame.
     def read(self) -> np.ndarray | None:
         if not self._running:
             return None
         if self._pending is not None:
-            frame = self._pending
-            self._pending = None
-            newer = self._dequeue_newest(block=False)
-            return newer if newer is not None else frame
-        return self._dequeue_newest(block=True)
+            frame, self._pending = self._pending, None
+            return frame
+        try:
+            return self._queue.get(timeout=2.0)
+        except queue.Empty:
+            return None
 
     def flush_to_live(self) -> None:
         """Drop queued pipe frames so Record starts at the live edge."""
